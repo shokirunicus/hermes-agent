@@ -22,6 +22,7 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        _prototype_quality_gate_prompt="",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -65,6 +66,32 @@ def _stable_prompt(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
+
+
+class TestPrototypeQualityGateBlock:
+    def test_absent_by_default(self):
+        stable = _stable_prompt(_make_agent())
+        assert "Prototype / Demo / Report Quality Gate" not in stable
+
+    def test_injected_when_agent_has_prompt(self):
+        from agent.prototype_quality_gate import QUALITY_GATE_PROMPT
+
+        stable = _stable_prompt(
+            _make_agent(_prototype_quality_gate_prompt=QUALITY_GATE_PROMPT)
+        )
+        assert "Prototype / Demo / Report Quality Gate" in stable
+        assert "Market-facing UI/UX layer" in stable
+        assert "Owner review layer" in stable
+        assert "Internal QA layer" in stable
+        assert "Never mix them" in stable
+
+    def test_config_builder_is_opt_in(self):
+        from agent.prototype_quality_gate import build_quality_gate_prompt
+
+        assert build_quality_gate_prompt({}) == ""
+        assert build_quality_gate_prompt({"prototype_quality_gate": {"enabled": False}}) == ""
+        prompt = build_quality_gate_prompt({"prototype_quality_gate": {"enabled": True}})
+        assert "Do not show the user a low-quality prototype" in prompt
 
 
 class TestCodingContextBlock:

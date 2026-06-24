@@ -164,6 +164,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
+    _quality_gate_prompt = getattr(agent, "_prototype_quality_gate_prompt", "")
+    if _quality_gate_prompt:
+        stable_parts.append(_quality_gate_prompt)
+
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
     # this targets (stopping after a stub; fabricating output when a real

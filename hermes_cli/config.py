@@ -1277,6 +1277,13 @@ DEFAULT_CONFIG = {
             "command": "codex",
         },
     },
+    # Prompt-level gate for market-facing demos, prototypes, MVPs, reports,
+    # landing pages, tools, apps, and sales artifacts. Disabled by default;
+    # enable per profile when the agent should block trash-level prototypes
+    # before presenting them as review-ready.
+    "prototype_quality_gate": {
+        "enabled": False,
+    },
 
     "compression": {
         "enabled": True,

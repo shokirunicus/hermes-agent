@@ -1281,6 +1281,17 @@ def init_agent(
         _platform_hints_cfg = {}
     agent._platform_hint_overrides = _platform_hints_cfg
 
+    # Prototype/demo/report quality gate. Default off globally; profiles that
+    # build market-facing prototypes can enable this to inject a stable
+    # system-prompt guard that separates market UI, owner review notes, and
+    # internal QA before the agent presents work as review-ready.
+    try:
+        from agent.prototype_quality_gate import build_quality_gate_prompt
+
+        agent._prototype_quality_gate_prompt = build_quality_gate_prompt(_agent_cfg)
+    except Exception:
+        agent._prototype_quality_gate_prompt = ""
+
     # App-level API retry count (wraps each model API call).  Default 3,
     # overridable via agent.api_max_retries in config.yaml.  See #11616.
     try:
