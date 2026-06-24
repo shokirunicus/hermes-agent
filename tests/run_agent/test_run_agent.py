@@ -1446,6 +1446,51 @@ class TestTaskCompletionGuidance:
             assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
 
 
+class TestPrototypeQualityGateIntegration:
+    """Config wiring for prototype_quality_gate.enabled.
+
+    Unit tests in tests/agent/test_system_prompt.py cover the prompt builder;
+    this integration test proves AIAgent init reads config.yaml and carries the
+    gate into the built system prompt.
+    """
+
+    def _make_agent(self, enabled=False):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"prototype_quality_gate": {"enabled": enabled}},
+            ),
+        ):
+            a = AIAgent(
+                model="anthropic/claude-opus-4.8",
+                api_key="-".join(["test", "key", "1234567890"]),
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_enabled_config_injects_gate(self):
+        agent = self._make_agent(enabled=True)
+        prompt = agent._build_system_prompt()
+        assert "Prototype / Demo / Report Quality Gate" in prompt
+        assert "Market-facing UI/UX layer" in prompt
+        assert "Owner review layer" in prompt
+        assert "Internal QA layer" in prompt
+
+    def test_disabled_config_omits_gate(self):
+        agent = self._make_agent(enabled=False)
+        assert "Prototype / Demo / Report Quality Gate" not in agent._build_system_prompt()
+
+
 class TestEnvironmentProbeIntegration:
     """Tests for the local Python toolchain probe wiring (config.yaml
     ``agent.environment_probe``).  The probe itself is unit-tested in
