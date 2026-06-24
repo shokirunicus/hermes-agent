@@ -1259,6 +1259,24 @@ DEFAULT_CONFIG = {
             "idempotent_no_progress": 5,
         },
     },
+    # Trigger-gated parent-owned orchestration. Disabled by default because it
+    # intentionally causes high-cost parallel work. Profiles that need it set
+    # enabled=true and choose a trigger phrase. When active, the current turn gets
+    # an ephemeral parent-control envelope; no session history or system prompt is
+    # mutated, preserving role alternation and prompt caching.
+    "max_output_orchestration": {
+        "enabled": False,
+        "trigger": "最強出力",
+        "hermes_child_agents": True,
+        "claude": {
+            "enabled": True,
+            "command": "claude",
+        },
+        "codex": {
+            "enabled": True,
+            "command": "codex",
+        },
+    },
 
     "compression": {
         "enabled": True,

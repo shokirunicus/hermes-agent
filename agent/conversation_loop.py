@@ -34,6 +34,7 @@ from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
+from agent.max_output_orchestration import build_max_output_context
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -559,6 +560,17 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _max_output_context = ""
+    try:
+        from hermes_cli.config import load_config as _load_runtime_config
+
+        _max_output_context = build_max_output_context(
+            original_user_message if isinstance(original_user_message, str) else user_message,
+            _load_runtime_config(),
+            cwd=os.environ.get("TERMINAL_CWD") or os.getcwd(),
+        )
+    except Exception as _max_output_err:
+        logger.debug("max-output orchestration context skipped: %s", _max_output_err)
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -752,6 +764,8 @@ def run_conversation(
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
+                if _max_output_context:
+                    _injections.append(_max_output_context)
                 if _injections:
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):
