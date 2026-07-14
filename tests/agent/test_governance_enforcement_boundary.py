@@ -266,6 +266,52 @@ def test_transform_dispatch_failure_fails_closed_when_required(agent, monkeypatc
     assert result["final_response"] == GOVERNANCE_FAIL_CLOSED_RESPONSE
 
 
+def test_missing_transform_hook_fails_closed_on_interrupted_partial(agent, monkeypatch):
+    # A dropped transform gate under required governance must fail closed even
+    # for an INTERRUPTED partial. Unlike the dispatch-crash test above there is
+    # no exception here: the hook is simply absent, so invoke_hook returns [].
+    # Before the wrap-up-review fix, the `and not interrupted` guard let this
+    # partial through raw — an interrupt became a delivery path for ungoverned
+    # text.
+    from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+    from agent.turn_finalizer import finalize_turn
+
+    monkeypatch.setattr(
+        plugins, "required_enforcement_active", lambda: True, raising=False
+    )
+    monkeypatch.setattr(
+        plugins,
+        "enforcement_hook_missing",
+        lambda name: name == "transform_llm_output",
+        raising=False,
+    )
+    monkeypatch.setattr(plugins, "has_hook", lambda name: False)
+    monkeypatch.setattr(plugins, "invoke_hook", lambda name, **kw: [])
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = finalize_turn(
+            agent,
+            final_response="raw interrupted partial",
+            api_call_count=1,
+            interrupted=True,
+            failed=False,
+            messages=[{"role": "user", "content": "strategic question"}],
+            conversation_history=[],
+            effective_task_id="task-1",
+            turn_id="turn-1",
+            user_message="strategic question",
+            original_user_message="strategic question",
+            _should_review_memory=False,
+            _turn_exit_reason="interrupted",
+        )
+    assert result["final_response"] == GOVERNANCE_FAIL_CLOSED_RESPONSE
+    assert "raw interrupted partial" not in (result["final_response"] or "")
+
+
 def test_pre_tool_call_dispatch_failure_blocks_when_required(monkeypatch):
     def _raising_hook(**kw):
         raise RuntimeError("governance hook crashed")

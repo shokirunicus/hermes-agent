@@ -339,10 +339,13 @@ def finalize_turn(
         # if the plugin layer is unloadable (validate_required_plugins).
         _required_enforcement = False
 
-    if _transform_hook_missing and final_response and not interrupted:
+    if _transform_hook_missing and final_response:
         # Governance is required but its transform gate is not registered —
-        # deliver the fail-closed replacement, never the ungoverned draft
-        # (2026-07-14 review, P1).
+        # deliver the fail-closed replacement, never the ungoverned draft.
+        # Covers interrupted partials too: _transform_hook_missing already
+        # implies required enforcement, and an interrupt must not become a
+        # delivery path for ungoverned text — matching the invoke condition
+        # below (2026-07-14 review, P1; interrupted gap found in wrap-up review).
         from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
 
         logger.error(
