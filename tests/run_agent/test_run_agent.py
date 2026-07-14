@@ -4128,6 +4128,39 @@ class TestRunConversation:
             message.get("content") for message in result["messages"]
         ]
 
+    def test_transformed_response_is_persisted_as_the_accepted_assistant(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="candidate answer", finish_reason="stop"
+        )
+        persisted_tail = []
+        trajectory_tail = []
+
+        def _invoke(name, **kwargs):
+            if name == "transform_llm_output":
+                return ["governed final answer"]
+            return []
+
+        def _capture_persisted(messages, _history=None):
+            persisted_tail.append(messages[-1].get("content"))
+
+        def _capture_trajectory(messages, *_args):
+            trajectory_tail.append(messages[-1].get("content"))
+
+        with (
+            patch("hermes_cli.plugins.has_hook", return_value=False),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_invoke),
+            patch.object(agent, "_persist_session", side_effect=_capture_persisted),
+            patch.object(agent, "_save_trajectory", side_effect=_capture_trajectory),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer strategically")
+
+        assert result["final_response"] == "governed final answer"
+        assert result["messages"][-1]["content"] == "governed final answer"
+        assert persisted_tail[-1] == "governed final answer"
+        assert trajectory_tail[-1] == "governed final answer"
+
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)
         agent.platform = None

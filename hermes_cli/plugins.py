@@ -242,6 +242,27 @@ def _get_disabled_plugins() -> set:
         return set()
 
 
+class RequiredPluginError(RuntimeError):
+    """Raised when an agent profile cannot load a configured required plugin."""
+
+
+def _get_required_plugins() -> set[str]:
+    """Return profile plugins that must load before an agent may start.
+
+    Management commands intentionally do not call the validator, so a broken
+    required plugin can still be repaired or disabled. Agent runtime entry
+    points call :func:`validate_required_plugins` after discovery.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        required = cfg_get(config, "plugins", "required", default=[])
+        return set(required) if isinstance(required, list) else set()
+    except Exception:
+        return set()
+
+
 def _get_enabled_plugins() -> Optional[set]:
     """Read the enabled-plugins allow-list from config.yaml.
 
@@ -2046,6 +2067,39 @@ def discover_plugins(force: bool = False) -> None:
     manifests and reload state in the current process.
     """
     get_plugin_manager().discover_and_load(force=force)
+
+
+def validate_required_plugins(manager: Optional[PluginManager] = None) -> None:
+    """Fail agent startup when a profile-required plugin is unavailable."""
+    required = _get_required_plugins()
+    if not required:
+        return
+
+    manager = manager or get_plugin_manager()
+    loaded_by_name: Dict[str, LoadedPlugin] = {}
+    for key, loaded in manager._plugins.items():
+        loaded_by_name[key] = loaded
+        loaded_by_name[loaded.manifest.name] = loaded
+        if loaded.manifest.key:
+            loaded_by_name[loaded.manifest.key] = loaded
+
+    failures: List[str] = []
+    for plugin_name in sorted(required):
+        loaded = loaded_by_name.get(plugin_name)
+        if loaded is None:
+            failures.append(f"{plugin_name}: missing")
+            continue
+        if not loaded.enabled or loaded.error:
+            failures.append(
+                f"{plugin_name}: {loaded.error or 'disabled or not registered'}"
+            )
+
+    if failures:
+        raise RequiredPluginError(
+            "Required plugin enforcement failed: "
+            + "; ".join(failures)
+            + ". Repair with `hermes plugins` or start with --safe-mode."
+        )
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:

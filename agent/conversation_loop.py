@@ -5251,7 +5251,10 @@ def run_conversation(
                             final_response=final_response,
                         )
                 except Exception:
-                    logger.debug("pre_response hook check failed", exc_info=True)
+                    logger.warning(
+                        "pre_response hook check failed; continuing without a nudge",
+                        exc_info=True,
+                    )
                     _response_nudge = None
 
                 if _response_nudge:
