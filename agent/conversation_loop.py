@@ -5310,15 +5310,20 @@ def run_conversation(
                 _response_gate_failed = False
                 try:
                     from hermes_cli.plugins import (
+                        enforcement_hook_missing,
                         get_pre_response_continue_message,
                         has_hook,
                     )
 
+                    # Required governance whose pre_response hook is absent
+                    # must not treat "no hook" as approval (2026-07-14, P1).
+                    if enforcement_hook_missing("pre_response"):
+                        _response_gate_failed = True
                     # Evaluate EVERY candidate — the nudge cap below only
                     # bounds how many regenerations are honored. Skipping
                     # evaluation of the final candidate would ship a draft
                     # no gate ever examined (2026-07-14 review, P1).
-                    if has_hook("pre_response"):
+                    elif has_hook("pre_response"):
                         _response_nudge = get_pre_response_continue_message(
                             session_id=getattr(agent, "session_id", None) or "",
                             turn_id=turn_id,

@@ -261,9 +261,59 @@ class GovernanceEnforcementError(RuntimeError):
 _ENFORCEMENT_HOOKS = frozenset({"pre_tool_call", "pre_response", "transform_llm_output"})
 
 
+def governance_config_unreadable() -> bool:
+    """True when the profile's config file exists but cannot be parsed.
+
+    This is the keystone of fail-closed governance. ``load_config()``
+    swallows a YAML parse error and silently falls back to ``DEFAULT_CONFIG``
+    — which has no ``plugins`` key — so a corrupt config would otherwise make
+    ``_get_required_plugins()`` return empty and disable every fail-closed
+    branch at once (2026-07-14 review, P0). When the file is present but
+    unparseable we cannot know whether governance was required, so we assume
+    it was: enforcement stays active and startup aborts. A genuinely absent
+    config (fresh profile) declared nothing and is allowed to run.
+    """
+    try:
+        from hermes_cli.config import get_config_path
+
+        path = get_config_path()
+        if not path.exists():
+            return False
+        import yaml
+
+        with open(path, encoding="utf-8") as handle:
+            yaml.safe_load(handle)
+        return False
+    except Exception:
+        # File is present and unreadable/unparseable — fail closed.
+        return True
+
+
 def required_enforcement_active() -> bool:
-    """True when the profile declares required plugins (fail-closed mode)."""
-    return bool(_get_required_plugins())
+    """True when governance must be enforced (fail-closed mode).
+
+    Either the profile declares required plugins, or its config could not be
+    parsed and we must assume governance was required.
+    """
+    return bool(_get_required_plugins()) or governance_config_unreadable()
+
+
+def enforcement_hook_missing(hook_name: str) -> bool:
+    """True when governance is required but *hook_name* is not registered.
+
+    ``required_enforcement_active()`` reads config, which can say True while
+    the plugin that should provide the hook silently failed to register (a
+    mid-session ``discover_plugins(force=True)`` that dropped it, or a config
+    unreadable enough that nothing loaded). An enforcement dispatch that finds
+    no registered hook must fail closed rather than treat "no result" as
+    approval (2026-07-14 review, P1).
+    """
+    if not required_enforcement_active():
+        return False
+    try:
+        return not has_hook(hook_name)
+    except Exception:
+        return True
 
 
 def _get_required_plugins() -> set[str]:
@@ -2104,6 +2154,16 @@ def discover_plugins(force: bool = False) -> None:
 
 def validate_required_plugins(manager: Optional[PluginManager] = None) -> None:
     """Fail agent startup when a profile-required plugin is unavailable."""
+    if governance_config_unreadable():
+        # We cannot even read whether governance is required. Running now
+        # would silently fall back to DEFAULT_CONFIG (no plugins) and start
+        # ungoverned — the exact P0 fail-open. Refuse instead.
+        raise RequiredPluginError(
+            "config.yaml could not be parsed, so required-plugin governance "
+            "cannot be verified. The agent will not start ungoverned. Fix the "
+            "YAML syntax in this profile's config.yaml, then retry."
+        )
+
     required = _get_required_plugins()
     if not required:
         return
@@ -2232,6 +2292,13 @@ def _get_pre_tool_call_directive_details(
         return _PreToolCallDirective(
             action="block",
             message=fmt.format(tool_name=tool_name),
+        )
+
+    if enforcement_hook_missing("pre_tool_call"):
+        return (
+            f"Tool '{tool_name}' blocked: governance is required for this "
+            "profile but its pre_tool_call enforcement hook is not registered. "
+            "Repair the governance plugin before running consequential actions."
         )
 
     try:

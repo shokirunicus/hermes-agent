@@ -399,3 +399,76 @@ def test_outer_dispatch_seeds_ambient_context_for_nested_calls(monkeypatch):
     finally:
         registry._tools.pop("nested_outer_probe", None)
     assert ("nested_inner_probe", "sess-9", "turn-7") in captured
+
+
+# ---------------------------------------------------------------------------
+# P0: a config that exists but cannot be parsed must fail CLOSED, not silently
+# fall back to DEFAULT_CONFIG (which has no plugins key) and disable everything.
+# ---------------------------------------------------------------------------
+
+
+def _point_config_at(monkeypatch, tmp_path, contents: str):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.config.get_config_path", lambda: cfg, raising=False
+    )
+    return cfg
+
+
+def test_unparseable_config_is_treated_as_governance_required(monkeypatch, tmp_path):
+    _point_config_at(monkeypatch, tmp_path, "plugins: [this is not: valid: yaml\n")
+    assert plugins.governance_config_unreadable() is True
+    assert plugins.required_enforcement_active() is True
+
+
+def test_unparseable_config_aborts_startup(monkeypatch, tmp_path):
+    _point_config_at(monkeypatch, tmp_path, "plugins: [broken\n  nested: ]\n")
+    with pytest.raises(plugins.RequiredPluginError, match="could not be parsed"):
+        plugins.validate_required_plugins(SimpleNamespace(_plugins={}))
+
+
+def test_a_valid_config_with_no_required_plugins_still_starts(monkeypatch, tmp_path):
+    _point_config_at(monkeypatch, tmp_path, "plugins:\n  enabled: []\n")
+    assert plugins.governance_config_unreadable() is False
+    plugins.validate_required_plugins(SimpleNamespace(_plugins={}))  # no raise
+
+
+def test_absent_config_does_not_force_governance(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hermes_cli.config.get_config_path",
+        lambda: tmp_path / "does-not-exist.yaml",
+        raising=False,
+    )
+    assert plugins.governance_config_unreadable() is False
+
+
+# ---------------------------------------------------------------------------
+# P1: enforcement keyed on config-declared required must also require the hook
+# to actually be registered — an absent required hook is not approval.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_required_hook_blocks_tools(monkeypatch):
+    monkeypatch.setattr(plugins, "required_enforcement_active", lambda: True)
+    monkeypatch.setattr(plugins, "has_hook", lambda name: False)
+    message = plugins.get_pre_tool_call_block_message(
+        "cronjob", {}, session_id="s1", turn_id="t1"
+    )
+    assert message is not None and "not registered" in message
+
+
+def test_present_required_hook_allows_normally(monkeypatch):
+    monkeypatch.setattr(plugins, "required_enforcement_active", lambda: True)
+    monkeypatch.setattr(plugins, "has_hook", lambda name: True)
+    monkeypatch.setattr(plugins, "invoke_hook", lambda name, **kw: [])
+    assert (
+        plugins.get_pre_tool_call_block_message("read_file", {}, session_id="s1")
+        is None
+    )
+
+
+def test_enforcement_hook_missing_is_false_without_required(monkeypatch):
+    monkeypatch.setattr(plugins, "required_enforcement_active", lambda: False)
+    monkeypatch.setattr(plugins, "has_hook", lambda name: False)
+    assert plugins.enforcement_hook_missing("pre_response") is False

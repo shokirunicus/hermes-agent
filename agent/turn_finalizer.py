@@ -325,14 +325,31 @@ def finalize_turn(
 
     _response_transformed = False
     _required_enforcement = False
+    _transform_hook_missing = False
     try:
-        from hermes_cli.plugins import required_enforcement_active as _rea
+        from hermes_cli.plugins import (
+            enforcement_hook_missing as _ehm,
+            required_enforcement_active as _rea,
+        )
 
         _required_enforcement = _rea()
+        _transform_hook_missing = _ehm("transform_llm_output")
     except Exception:
         # A profile that truly requires governance already refused to start
         # if the plugin layer is unloadable (validate_required_plugins).
         _required_enforcement = False
+
+    if _transform_hook_missing and final_response and not interrupted:
+        # Governance is required but its transform gate is not registered —
+        # deliver the fail-closed replacement, never the ungoverned draft
+        # (2026-07-14 review, P1).
+        from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+
+        logger.error(
+            "transform_llm_output required but not registered; failing closed"
+        )
+        final_response = GOVERNANCE_FAIL_CLOSED_RESPONSE
+        _response_transformed = True
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
