@@ -1247,6 +1247,8 @@ Fires **once per turn** after the tool-calling loop completes and the model has 
 def my_callback(
     response_text: str,
     session_id: str,
+    turn_id: str,
+    user_message: str,
     model: str,
     platform: str,
     **kwargs,
@@ -1257,6 +1259,8 @@ def my_callback(
 |-----------|------|-------------|
 | `response_text` | `str` | The assistant's final response text for this turn. |
 | `session_id` | `str` | Session ID for this conversation (may be empty for one-shot runs). |
+| `turn_id` | `str` | Turn ID, so a policy hook can key its state to the exact turn it is judging. |
+| `user_message` | `str` | The user text that opened this turn — lets a gate judge the response *against the request* (e.g. did it switch modes uninvited). |
 | `model` | `str` | Model name that produced the response (e.g. `anthropic/claude-sonnet-4.6`). |
 | `platform` | `str` | Delivery platform (`cli`, `telegram`, `discord`, …; empty when unset). |
 

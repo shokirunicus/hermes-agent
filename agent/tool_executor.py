@@ -426,8 +426,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     middleware_trace=list(middleware_trace),
                 )
-            except Exception:
+            except Exception as _gate_err:
                 block_message = None
+                try:
+                    from hermes_cli.plugins import required_enforcement_active
+
+                    if required_enforcement_active():
+                        # Required governance could not evaluate this call —
+                        # a dispatch failure is a block, not an allow.
+                        block_message = (
+                            f"Tool '{function_name}' blocked: required "
+                            "governance enforcement was unavailable "
+                            f"({_gate_err}). Repair the governance plugin "
+                            "before retrying consequential actions."
+                        )
+                except Exception:
+                    pass
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)

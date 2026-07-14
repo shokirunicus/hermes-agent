@@ -14,6 +14,16 @@ from utils import is_truthy_value
 DEFAULT_MAX_VERIFY_NUDGES = 3
 DEFAULT_MAX_RESPONSE_NUDGES = 2
 
+# Returned instead of the model's draft when required governance could not
+# evaluate it (enforcement dispatch crashed). Profiles that configure
+# ``plugins.required`` opt into fail-closed delivery: an unaudited draft is
+# never returned or persisted.
+GOVERNANCE_FAIL_CLOSED_RESPONSE = (
+    "この回答は認知統治の監査を実行できなかったため配信を止めました。"
+    "もう一度、依頼を言い換えて送ってください。"
+    "(governance fail-closed: an unaudited draft is never delivered)"
+)
+
 # Shipped guidance appended to the verification-stop nudge when code lacks fresh
 # verification evidence. Wording mirrors the user-facing "clean your work"
 # workflow, but does not create its own extra model turn.
@@ -73,6 +83,7 @@ __all__ = [
     "CODING_VERIFY_GUIDANCE",
     "DEFAULT_MAX_RESPONSE_NUDGES",
     "DEFAULT_MAX_VERIFY_NUDGES",
+    "GOVERNANCE_FAIL_CLOSED_RESPONSE",
     "coding_verify_guidance",
     "max_response_nudges",
     "max_verify_nudges",

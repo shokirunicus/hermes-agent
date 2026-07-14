@@ -246,6 +246,26 @@ class RequiredPluginError(RuntimeError):
     """Raised when an agent profile cannot load a configured required plugin."""
 
 
+class GovernanceEnforcementError(RuntimeError):
+    """Raised when an enforcement hook crashed while governance is required.
+
+    Ordinary hook dispatch isolates plugin exceptions (observers must not
+    break the agent loop). Enforcement hooks are the opposite contract: when
+    a profile declares ``plugins.required``, a crashed enforcement callback
+    means policy could not be evaluated, and the caller must fail closed
+    (block the tool / withhold the draft) instead of silently allowing.
+    """
+
+
+# Hooks whose absence-of-answer must never be confused with approval.
+_ENFORCEMENT_HOOKS = frozenset({"pre_tool_call", "pre_response", "transform_llm_output"})
+
+
+def required_enforcement_active() -> bool:
+    """True when the profile declares required plugins (fail-closed mode)."""
+    return bool(_get_required_plugins())
+
+
 def _get_required_plugins() -> set[str]:
     """Return profile plugins that must load before an agent may start.
 
@@ -1935,18 +1955,31 @@ class PluginManager:
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
+        dispatch_errors: List[str] = []
         for cb in callbacks:
             try:
                 ret = cb(**kwargs)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                dispatch_errors.append(
+                    f"{getattr(cb, '__name__', repr(cb))}: {exc}"
+                )
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+        if (
+            dispatch_errors
+            and hook_name in _ENFORCEMENT_HOOKS
+            and required_enforcement_active()
+        ):
+            raise GovernanceEnforcementError(
+                f"enforcement hook '{hook_name}' could not be evaluated: "
+                + "; ".join(dispatch_errors)
+            )
         return results
 
     def has_hook(self, hook_name: str) -> bool:
@@ -2098,7 +2131,10 @@ def validate_required_plugins(manager: Optional[PluginManager] = None) -> None:
         raise RequiredPluginError(
             "Required plugin enforcement failed: "
             + "; ".join(failures)
-            + ". Repair with `hermes plugins` or start with --safe-mode."
+            + ". Repair with `hermes plugins`, or remove the plugin from "
+            "`plugins.required` in config.yaml to opt out of enforcement. "
+            "Safe mode does not bypass this check: a profile that requires "
+            "governance refuses to run ungoverned."
         )
 
 
@@ -2198,17 +2234,25 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
-    hook_results = invoke_hook(
-        "pre_tool_call",
-        tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
-        task_id=task_id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-        middleware_trace=list(middleware_trace or []),
-    )
+    try:
+        hook_results = invoke_hook(
+            "pre_tool_call",
+            tool_name=tool_name,
+            args=args if isinstance(args, dict) else {},
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            middleware_trace=list(middleware_trace or []),
+        )
+    except GovernanceEnforcementError as exc:
+        # Required governance could not evaluate this call — fail closed.
+        return (
+            f"Tool '{tool_name}' blocked: required governance enforcement "
+            f"was unavailable ({exc}). Repair the governance plugin before "
+            "retrying consequential actions."
+        )
 
     for result in hook_results:
         if not isinstance(result, dict):

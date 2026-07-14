@@ -26,6 +26,53 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+def enforce_direct_final(agent, text, *, turn_id="", user_message=""):
+    """Apply the transform gate to a final delivered outside ``finalize_turn``.
+
+    A handful of recovery paths (e.g. the truncation-partial return) hand
+    model-generated text straight back to the caller. Under required
+    governance that text must pass the same transform gate as a normal
+    final; on gate failure it is replaced, never delivered raw.
+    """
+    if not text:
+        return text
+    from agent.conversation_loop import logger
+
+    _required = False
+    try:
+        from hermes_cli.plugins import required_enforcement_active
+
+        _required = required_enforcement_active()
+    except Exception:
+        _required = False
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        for _hook_result in invoke_hook(
+            "transform_llm_output",
+            response_text=text,
+            session_id=agent.session_id or "",
+            turn_id=turn_id or "",
+            user_message=user_message or "",
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        ):
+            if isinstance(_hook_result, str) and _hook_result:
+                return _hook_result
+    except Exception as exc:
+        if _required:
+            from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+
+            logger.error(
+                "direct-final transform failed under required governance; "
+                "failing closed: %s",
+                exc,
+            )
+            return GOVERNANCE_FAIL_CLOSED_RESPONSE
+        logger.warning("direct-final transform failed: %s", exc)
+    return text
+
+
 def finalize_turn(
     agent,
     *,
@@ -277,18 +324,31 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _required_enforcement = False
+    try:
+        from hermes_cli.plugins import required_enforcement_active as _rea
+
+        _required_enforcement = _rea()
+    except Exception:
+        # A profile that truly requires governance already refused to start
+        # if the plugin layer is unloadable (validate_required_plugins).
+        _required_enforcement = False
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    # Under required governance the gate also covers interrupted partials —
+    # an interrupt must not become a delivery path for ungoverned text.
+    if final_response and (not interrupted or _required_enforcement):
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
+                turn_id=turn_id or "",
+                user_message=original_user_message or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
@@ -298,7 +358,20 @@ def finalize_turn(
                     _response_transformed = True
                     break  # First non-empty string wins
         except Exception as exc:
-            logger.warning("transform_llm_output hook failed: %s", exc)
+            if _required_enforcement:
+                # Required governance could not examine the final text —
+                # deliver the fail-closed replacement, never the raw draft.
+                from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+
+                logger.error(
+                    "transform_llm_output failed under required governance; "
+                    "failing closed: %s",
+                    exc,
+                )
+                final_response = GOVERNANCE_FAIL_CLOSED_RESPONSE
+                _response_transformed = True
+            else:
+                logger.warning("transform_llm_output hook failed: %s", exc)
 
     # Persist only the accepted, post-transform response. A governance or
     # redaction transform must not show one answer to the caller while leaving
