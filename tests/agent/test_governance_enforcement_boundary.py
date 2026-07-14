@@ -424,7 +424,7 @@ def test_unparseable_config_is_treated_as_governance_required(monkeypatch, tmp_p
 
 def test_unparseable_config_aborts_startup(monkeypatch, tmp_path):
     _point_config_at(monkeypatch, tmp_path, "plugins: [broken\n  nested: ]\n")
-    with pytest.raises(plugins.RequiredPluginError, match="could not be parsed"):
+    with pytest.raises(plugins.RequiredPluginError, match="could not be read"):
         plugins.validate_required_plugins(SimpleNamespace(_plugins={}))
 
 
@@ -432,6 +432,34 @@ def test_a_valid_config_with_no_required_plugins_still_starts(monkeypatch, tmp_p
     _point_config_at(monkeypatch, tmp_path, "plugins:\n  enabled: []\n")
     assert plugins.governance_config_unreadable() is False
     plugins.validate_required_plugins(SimpleNamespace(_plugins={}))  # no raise
+
+
+def test_malformed_required_type_is_governance_required(monkeypatch, tmp_path):
+    # plugins.required present but the wrong shape (a mapping, not a list) is a
+    # broken enforcement declaration: _get_required_plugins() would coerce it to
+    # empty and silently disable governance. Fail closed instead (re-review).
+    _point_config_at(
+        monkeypatch, tmp_path, "plugins:\n  required:\n    cognitive-governance: true\n"
+    )
+    assert plugins.governance_config_unreadable() is True
+    assert plugins.required_enforcement_active() is True
+    with pytest.raises(plugins.RequiredPluginError, match="not a list"):
+        plugins.validate_required_plugins(SimpleNamespace(_plugins={}))
+
+
+def test_required_as_list_is_read_normally(monkeypatch, tmp_path):
+    # The well-formed shape must NOT trip the malformed-type guard.
+    _point_config_at(
+        monkeypatch, tmp_path, "plugins:\n  required:\n    - cognitive-governance\n"
+    )
+    assert plugins.governance_config_unreadable() is False
+    assert plugins.required_enforcement_active() is True
+
+
+def test_absent_required_key_does_not_force_governance(monkeypatch, tmp_path):
+    # A plugins block with no `required` key declared nothing — must still run.
+    _point_config_at(monkeypatch, tmp_path, "plugins:\n  enabled:\n    - foo\n")
+    assert plugins.governance_config_unreadable() is False
 
 
 def test_absent_config_does_not_force_governance(monkeypatch, tmp_path):

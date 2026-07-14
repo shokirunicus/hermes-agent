@@ -262,16 +262,23 @@ _ENFORCEMENT_HOOKS = frozenset({"pre_tool_call", "pre_response", "transform_llm_
 
 
 def governance_config_unreadable() -> bool:
-    """True when the profile's config file exists but cannot be parsed.
+    """True when the profile's config cannot be trusted to declare governance.
 
     This is the keystone of fail-closed governance. ``load_config()``
     swallows a YAML parse error and silently falls back to ``DEFAULT_CONFIG``
     — which has no ``plugins`` key — so a corrupt config would otherwise make
     ``_get_required_plugins()`` return empty and disable every fail-closed
-    branch at once (2026-07-14 review, P0). When the file is present but
-    unparseable we cannot know whether governance was required, so we assume
-    it was: enforcement stays active and startup aborts. A genuinely absent
-    config (fresh profile) declared nothing and is allowed to run.
+    branch at once (2026-07-14 review, P0). Two cases mean "we cannot know
+    what governance was required," and both fail closed (enforcement stays
+    active and startup aborts):
+
+      * the file is present but unparseable, or
+      * it parses, but ``plugins.required`` is present with a non-list type —
+        a malformed enforcement declaration that ``_get_required_plugins()``
+        would otherwise coerce silently to "nothing required" (re-review).
+
+    A genuinely absent config (fresh profile), or an absent/empty ``required``
+    key, declared nothing and is allowed to run.
     """
     try:
         from hermes_cli.config import get_config_path
@@ -282,7 +289,13 @@ def governance_config_unreadable() -> bool:
         import yaml
 
         with open(path, encoding="utf-8") as handle:
-            yaml.safe_load(handle)
+            parsed = yaml.safe_load(handle)
+        if isinstance(parsed, dict):
+            plugins_cfg = parsed.get("plugins")
+            if isinstance(plugins_cfg, dict) and "required" in plugins_cfg:
+                if not isinstance(plugins_cfg["required"], list):
+                    # Enforcement was declared but in a shape we cannot read.
+                    return True
         return False
     except Exception:
         # File is present and unreadable/unparseable — fail closed.
@@ -2159,9 +2172,11 @@ def validate_required_plugins(manager: Optional[PluginManager] = None) -> None:
         # would silently fall back to DEFAULT_CONFIG (no plugins) and start
         # ungoverned — the exact P0 fail-open. Refuse instead.
         raise RequiredPluginError(
-            "config.yaml could not be parsed, so required-plugin governance "
-            "cannot be verified. The agent will not start ungoverned. Fix the "
-            "YAML syntax in this profile's config.yaml, then retry."
+            "config.yaml could not be read as a governance declaration (invalid "
+            "YAML, or plugins.required is not a list), so required-plugin "
+            "governance cannot be verified. The agent will not start ungoverned. "
+            "Fix this profile's config.yaml (valid YAML; plugins.required must be "
+            "a list), then retry."
         )
 
     required = _get_required_plugins()
