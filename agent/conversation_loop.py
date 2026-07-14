@@ -5223,6 +5223,62 @@ def run_conversation(
                                  agent._pre_verify_nudges)
                     continue
 
+                # Generic response-governance gate. Unlike
+                # ``transform_llm_output``, this hook can reject a draft and ask
+                # the model to regenerate before anything is returned. The
+                # synthetic assistant/user pair preserves role alternation and
+                # is excluded from durable session state.
+                _response_nudge = None
+                _response_attempt = getattr(agent, "_pre_response_nudges", 0)
+                try:
+                    from agent.verify_hooks import max_response_nudges
+                    from hermes_cli.plugins import (
+                        get_pre_response_continue_message,
+                        has_hook,
+                    )
+
+                    if (
+                        has_hook("pre_response")
+                        and _response_attempt < max_response_nudges()
+                    ):
+                        _response_nudge = get_pre_response_continue_message(
+                            session_id=getattr(agent, "session_id", None) or "",
+                            turn_id=turn_id,
+                            platform=getattr(agent, "platform", None) or "",
+                            model=getattr(agent, "model", None) or "",
+                            attempt=_response_attempt,
+                            user_message=original_user_message,
+                            final_response=final_response,
+                        )
+                except Exception:
+                    logger.debug("pre_response hook check failed", exc_info=True)
+                    _response_nudge = None
+
+                if _response_nudge:
+                    agent._pre_response_nudges = _response_attempt + 1
+                    final_msg["finish_reason"] = "response_governance_continue"
+                    final_msg["_pre_response_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _response_nudge,
+                        "_pre_response_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug(
+                        "pre_response nudge issued (attempt %d)",
+                        agent._pre_response_nudges,
+                    )
+                    continue
+
+                if _response_attempt:
+                    messages = [
+                        message
+                        for message in messages
+                        if not message.get("_pre_response_synthetic")
+                    ]
+                    agent._session_messages = messages
+
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"

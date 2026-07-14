@@ -154,6 +154,10 @@ VALID_HOOKS: Set[str] = {
     # verification-stop nudge; this hook is for user/plugin policy and is
     # bounded by agent.max_verify_nudges.
     "pre_verify",
+    # Generic round-end gate. A callback may reject a draft and keep the same
+    # turn running by returning {"action": "continue", "message": "..."}.
+    # The loop bounds retries via agent.max_response_nudges.
+    "pre_response",
     "pre_api_request",
     "post_api_request",
     "api_request_error",
@@ -2310,6 +2314,47 @@ def get_pre_verify_continue_message(
         attempt=attempt,
         final_response=final_response,
         changed_paths=list(changed_paths or []),
+    )
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = str(result.get("action") or result.get("decision") or "").strip().lower()
+        if action not in ("continue", "block"):
+            continue
+        message = result.get("message") or result.get("reason")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    return None
+
+
+def get_pre_response_continue_message(
+    *,
+    session_id: str = "",
+    turn_id: str = "",
+    platform: str = "",
+    model: str = "",
+    attempt: int = 0,
+    user_message: str = "",
+    final_response: str = "",
+) -> Optional[str]:
+    """Check ``pre_response`` hooks before returning a draft to the user.
+
+    A hook can keep the same turn running by returning
+    ``{"action": "continue", "message": "<follow-up>"}``. The Claude-Code
+    stop shape (``decision=block``) is accepted for hook compatibility. The
+    caller owns retry bounds and role-alternation-safe synthetic messages.
+    """
+    hook_results = invoke_hook(
+        "pre_response",
+        session_id=session_id,
+        turn_id=turn_id,
+        platform=platform,
+        model=model,
+        attempt=attempt,
+        user_message=user_message,
+        final_response=final_response,
     )
 
     for result in hook_results:

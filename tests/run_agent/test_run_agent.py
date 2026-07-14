@@ -4098,6 +4098,36 @@ class TestRunConversation:
         assert hook_checks == {"pre_api_request": 1, "post_api_request": 1}
         assert payload_counts == {"request": 0, "response": 0}
 
+    def test_pre_response_hook_regenerates_before_finalizing(self, agent):
+        self._setup_agent(agent)
+        draft = _mock_response(content="unsafe first draft", finish_reason="stop")
+        audited = _mock_response(content="audited final answer", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [draft, audited]
+
+        def _has_hook(name):
+            return name == "pre_response"
+
+        with (
+            patch("hermes_cli.plugins.has_hook", side_effect=_has_hook),
+            patch(
+                "hermes_cli.plugins.get_pre_response_continue_message",
+                side_effect=["audit and regenerate", None],
+            ) as gate,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer strategically")
+
+        assert result["final_response"] == "audited final answer"
+        assert result["api_calls"] == 2
+        assert gate.call_count == 2
+        assert gate.call_args_list[0].kwargs["attempt"] == 0
+        assert gate.call_args_list[1].kwargs["attempt"] == 1
+        assert "unsafe first draft" not in [
+            message.get("content") for message in result["messages"]
+        ]
+
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)
         agent.platform = None
