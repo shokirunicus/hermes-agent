@@ -442,6 +442,10 @@ def test_outer_dispatch_seeds_ambient_context_for_nested_calls(monkeypatch):
         registry._tools.pop("nested_outer_probe", None)
     assert ("nested_inner_probe", "sess-9", "turn-7") in captured
 
+    captured.clear()
+    model_tools.handle_function_call("nested_inner_probe", {}, "task-2")
+    assert captured == [("nested_inner_probe", "", "")]
+
 
 # ---------------------------------------------------------------------------
 # P0: a config that exists but cannot be parsed must fail CLOSED, not silently

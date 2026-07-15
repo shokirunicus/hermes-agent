@@ -29,6 +29,7 @@ import logging
 import threading
 import time
 from contextlib import contextmanager
+from functools import wraps
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
@@ -241,6 +242,30 @@ def dispatch_context(session_id: str = "", turn_id: str = ""):
         yield
     finally:
         _DISPATCH_IDENTITY.reset(token)
+
+
+def _scoped_dispatch_identity(func):
+    """Keep explicit dispatch identity scoped to one outer tool call.
+
+    Nested synchronous dispatch inherits the active identity, but the binding
+    is reset before the caller's next unrelated tool call. Positional support
+    preserves the public ``handle_function_call`` signature.
+    """
+
+    @wraps(func)
+    def _wrapped(*args, **kwargs):
+        explicit_session = kwargs.get(
+            "session_id", args[4] if len(args) > 4 else None
+        )
+        explicit_turn = kwargs.get("turn_id", args[5] if len(args) > 5 else None)
+        ambient_session, ambient_turn = _DISPATCH_IDENTITY.get()
+        with dispatch_context(
+            session_id=explicit_session or ambient_session,
+            turn_id=explicit_turn or ambient_turn,
+        ):
+            return func(*args, **kwargs)
+
+    return _wrapped
 
 
 # =============================================================================
@@ -1051,6 +1076,7 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+@_scoped_dispatch_identity
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1103,12 +1129,6 @@ def handle_function_call(
     _ambient_session, _ambient_turn = _DISPATCH_IDENTITY.get()
     session_id = session_id or _ambient_session or None
     turn_id = turn_id or _ambient_turn or None
-    if (session_id or turn_id) and (session_id, turn_id) != (
-        _ambient_session or None,
-        _ambient_turn or None,
-    ):
-        _DISPATCH_IDENTITY.set((session_id or "", turn_id or ""))
-
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
