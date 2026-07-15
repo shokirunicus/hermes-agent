@@ -1041,6 +1041,11 @@ class TestLaunchdServiceRecovery:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_retry_launchctl_bootstrap_until_registered",
+            lambda *args, **kwargs: False,
+        )
 
         spawned = []
         monkeypatch.setattr(
@@ -1053,6 +1058,56 @@ class TestLaunchdServiceRecovery:
         assert "background process" in capsys.readouterr().out.lower()
         # Verify the unsupported marker was written so status can explain why
         assert gateway_cli._launchd_unsupported_marker_exists()
+
+    def test_launchd_start_retries_transient_rebootstrap_before_detached(
+        self, tmp_path, monkeypatch
+    ):
+        """A transient bootstrap EIO must not immediately lose supervision."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli, "refresh_launchd_plist_if_needed", lambda: False
+        )
+
+        kickstarts = 0
+
+        def fake_run(cmd, check=False, **kwargs):
+            nonlocal kickstarts
+            if cmd == ["launchctl", "kickstart", target]:
+                kickstarts += 1
+                if kickstarts == 1:
+                    raise gateway_cli.subprocess.CalledProcessError(
+                        125, cmd, stderr="Domain does not support specified action"
+                    )
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    5, cmd, stderr="Input/output error"
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        retries = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_retry_launchctl_bootstrap_until_registered",
+            lambda *args, **kwargs: retries.append((args, kwargs)) or True,
+        )
+        spawned = []
+        monkeypatch.setattr(
+            gateway_cli, "_spawn_detached_gateway", lambda: spawned.append(True) or True
+        )
+
+        gateway_cli.launchd_start()
+
+        assert len(retries) == 1
+        assert kickstarts == 2
+        assert spawned == []
 
     def test_launchd_install_falls_back_to_detached_on_bootstrap_5(self, tmp_path, monkeypatch, capsys):
         """macOS bootstrap error 5 should spawn a detached gateway, not crash."""
@@ -1091,7 +1146,7 @@ class TestLaunchdServiceRecovery:
         assert gateway_cli._launchd_unsupported_marker_exists()
 
     def test_launchd_restart_falls_back_to_detached_on_error_5(self, monkeypatch, capsys):
-        """kickstart -k error 5 (domain unmanageable) should relaunch detached."""
+        """Persistent launchd error 5 should relaunch detached after retries."""
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
@@ -1101,13 +1156,21 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
 
         def fake_run(cmd, check=False, **kwargs):
-            if cmd == ["launchctl", "kickstart", "-k", target]:
+            if cmd == ["launchctl", "kickstart", "-k", target] or cmd[:2] == [
+                "launchctl",
+                "bootstrap",
+            ]:
                 raise gateway_cli.subprocess.CalledProcessError(
                     5, cmd, stderr="Input/output error"
                 )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_retry_launchctl_bootstrap_until_registered",
+            lambda *args, **kwargs: False,
+        )
 
         spawned = []
         monkeypatch.setattr(
@@ -1118,6 +1181,58 @@ class TestLaunchdServiceRecovery:
 
         assert spawned == [True]
         assert gateway_cli._launchd_unsupported_marker_exists()
+
+    def test_launchd_restart_retries_transient_error_5_before_detached(
+        self, tmp_path, monkeypatch
+    ):
+        """A transient restart EIO must recover launchd before using fallback."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        monkeypatch.setattr(
+            gateway_cli, "_request_gateway_self_restart", lambda pid: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_gateway_exit",
+            lambda timeout, force_after=None: True,
+        )
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd == ["launchctl", "kickstart", "-k", target]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    5, cmd, stderr="Input/output error"
+                )
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    5, cmd, stderr="Input/output error"
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        retries = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_retry_launchctl_bootstrap_until_registered",
+            lambda *args, **kwargs: retries.append((args, kwargs)) or True,
+        )
+        spawned = []
+        monkeypatch.setattr(
+            gateway_cli, "_spawn_detached_gateway", lambda: spawned.append(True) or True
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert len(retries) == 1
+        assert spawned == []
 
     def test_launchd_restart_boots_out_stale_registration_before_bootstrap(
         self, tmp_path, monkeypatch
