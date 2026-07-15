@@ -16,6 +16,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
+from agent.redact import redact_sensitive_text
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -302,6 +303,7 @@ class DeliveryRouter:
                     "result": result
                 }
             except Exception as e:
+                safe_error = redact_sensitive_text(str(e), force=True)[:500]
                 # A hard failure raises here. If the platform reported a
                 # whole-chat death, record it so future deliveries short-circuit.
                 if target.platform != Platform.LOCAL and target.chat_id:
@@ -309,11 +311,11 @@ class DeliveryRouter:
                     if dead_kind:
                         self.dead_targets.mark_dead(
                             target.platform.value, target.chat_id,
-                            reason=f"{dead_kind}: {str(e)[:120]}",
+                            reason=f"{dead_kind}: delivery failed",
                         )
                 results[target.to_string()] = {
                     "success": False,
-                    "error": str(e)
+                    "error": safe_error,
                 }
         
         return results
@@ -551,7 +553,5 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
 
 

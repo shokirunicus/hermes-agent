@@ -662,12 +662,32 @@ class SignalAdapter(BasePlatformAdapter):
         reply_to_author_name = quote_data.get("authorName") or quote_data.get("authorProfileName")
         reply_to_is_own = self._quote_references_own_message(reply_to_id, reply_to_author)
 
-        # Process attachments
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=group_info.get("groupName") if group_info else sender_name,
+            chat_type=chat_type,
+            user_id=sender,
+            user_name=sender_name or sender,
+            user_id_alt=sender_uuid if sender_uuid else None,
+            chat_id_alt=group_id if is_group else None,
+        )
+        sender_authorized = self._is_sender_authorized(
+            sender, chat_type, chat_id
+        )
         attachments_data = data_message.get("attachments", [])
+        if sender_authorized is False and attachments_data:
+            if not text:
+                text = "(attachment omitted until sender is authorized)"
+
+        # Process attachments
         media_urls = []
         media_types = []
 
-        if attachments_data and not getattr(self, "ignore_attachments", False):
+        if (
+            attachments_data
+            and sender_authorized is not False
+            and not getattr(self, "ignore_attachments", False)
+        ):
             for att in attachments_data:
                 att_id = att.get("id")
                 att_size = att.get("size", 0)
@@ -697,17 +717,6 @@ class SignalAdapter(BasePlatformAdapter):
                 redact_phone(sender), len(media_urls) if media_urls else 0,
             )
             return
-
-        # Build session source
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=group_info.get("groupName") if group_info else sender_name,
-            chat_type=chat_type,
-            user_id=sender,
-            user_name=sender_name or sender,
-            user_id_alt=sender_uuid if sender_uuid else None,
-            chat_id_alt=group_id if is_group else None,
-        )
 
         # Determine message type from media
         msg_type = MessageType.TEXT

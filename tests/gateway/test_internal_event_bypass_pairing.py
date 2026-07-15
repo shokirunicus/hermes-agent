@@ -9,7 +9,7 @@ pairing code to the chat.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -190,6 +190,38 @@ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_external_origin_internal_event_without_user_is_reauthorized(
+    monkeypatch, tmp_path
+):
+    """Externally derived no-user events must fail closed after revocation."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("", encoding="utf-8")
+    runner = GatewayRunner(GatewayConfig())
+    auth = Mock(return_value=False)
+    sink = AsyncMock(return_value="unexpected")
+    monkeypatch.setattr(runner, "_is_user_authorized", auth)
+    monkeypatch.setattr(runner, "_handle_message_with_agent", sink)
+
+    event = MessageEvent(
+        text="[SYSTEM: Background process completed]",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="revoked-chat",
+            chat_type="group",
+            user_id=None,
+        ),
+        internal=True,
+        metadata={"reauthorize_source": True},
+    )
+
+    assert await runner._handle_message(event) is None
+    auth.assert_called_once_with(event.source)
+    sink.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_internal_event_does_not_trigger_pairing(monkeypatch, tmp_path):
     """An internal event with no user_id must not generate a pairing code."""
     import gateway.run as gateway_run
@@ -316,6 +348,7 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
     assert adapter.handle_message.await_count == 1
     event = adapter.handle_message.await_args.args[0]
     assert event.internal is True
+    assert event.metadata["reauthorize_source"] is True
     assert event.source.platform == Platform.TELEGRAM
     assert event.source.chat_id == "-100"
     assert event.source.chat_type == "group"

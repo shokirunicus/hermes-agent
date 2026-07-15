@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from hermes_cli.config import get_hermes_home
+from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -107,12 +108,13 @@ class DeadTargetRegistry:
         if not chat_id:
             return False
         key = _normalize(platform, chat_id)
+        safe_reason = redact_sensitive_text(str(reason), force=True)[:200]
         with self._lock:
             existed = key in self._dead
             self._dead[key] = {
                 "platform": str(platform).strip().lower(),
                 "chat_id": str(chat_id),
-                "reason": str(reason)[:200],
+                "reason": safe_reason,
                 "marked_at": time.time(),
             }
             self._flush_locked()
@@ -120,7 +122,7 @@ class DeadTargetRegistry:
             logger.info(
                 "dead_targets: marked %s as unreachable (%s) — future deliveries "
                 "to this target will be skipped until a send succeeds",
-                key, reason or "no reason given",
+                key, safe_reason or "no reason given",
             )
         return not existed
 

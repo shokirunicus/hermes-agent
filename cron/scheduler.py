@@ -462,6 +462,14 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+def _mirror_profile_name() -> str:
+    """Return the gateway session-key profile for cron transcript mirrors."""
+    from hermes_cli.profiles import get_active_profile_name
+
+    name = get_active_profile_name()
+    return "main" if name in {"", "default"} else name
+
+
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata.
 
@@ -599,6 +607,7 @@ def _maybe_mirror_cron_delivery(
             source_label="cron",
             thread_id=thread_id,
             user_id=user_id,
+            profile=_mirror_profile_name(),
             role="user",
         )
         if ok:
@@ -720,6 +729,7 @@ def _seed_cron_thread_session(
             source_label="cron",
             thread_id=str(thread_id),
             user_id="system:cron",
+            profile=_mirror_profile_name(),
             role="user",
         )
         logger.info(
@@ -813,6 +823,7 @@ def _seed_cron_channel_session(
             source_label="cron",
             thread_id=None,
             user_id=str(user_id) if user_id else None,
+            profile=_mirror_profile_name(),
             role="user",
         )
         if ok:

@@ -117,6 +117,31 @@ class TestBlockingGatewayApproval:
         assert entry.result == "once"
         unregister_gateway_notify(session_key)
 
+    def test_gateway_request_is_assigned_and_resolved_by_request_id(self):
+        from tools.approval import (
+            _await_gateway_decision,
+            resolve_gateway_approval,
+        )
+
+        captured = {}
+
+        def notify(data):
+            captured.update(data)
+            assert resolve_gateway_approval(
+                "request-id-session",
+                "once",
+                request_id=data["request_id"],
+            ) == 1
+
+        result = _await_gateway_decision(
+            "request-id-session",
+            notify,
+            {"command": "echo safe", "pattern_key": "test"},
+        )
+
+        assert len(captured["request_id"]) >= 8
+        assert result == {"resolved": True, "choice": "once", "reason": None}
+
     def test_resolve_returns_zero_when_no_pending(self):
         from tools.approval import resolve_gateway_approval
         assert resolve_gateway_approval("nonexistent", "once") == 0
@@ -154,6 +179,51 @@ class TestBlockingGatewayApproval:
         assert e1.result == "once"
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
+
+    def test_stale_request_id_cannot_resolve_later_approval(self):
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            resolve_gateway_approval,
+        )
+
+        session_key = "test-request-binding"
+        later = _ApprovalEntry({"command": "second", "request_id": "later123"})
+        _gateway_queues[session_key] = [later]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            request_id="expired123",
+        )
+
+        assert count == 0
+        assert not later.event.is_set()
+        assert _gateway_queues[session_key] == [later]
+
+    def test_request_id_resolves_only_the_exact_approval(self):
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            resolve_gateway_approval,
+        )
+
+        session_key = "test-request-selection"
+        first = _ApprovalEntry({"command": "first", "request_id": "first123"})
+        second = _ApprovalEntry({"command": "second", "request_id": "second123"})
+        _gateway_queues[session_key] = [first, second]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "deny",
+            request_id="second123",
+        )
+
+        assert count == 1
+        assert not first.event.is_set()
+        assert second.event.is_set()
+        assert second.result == "deny"
+        assert _gateway_queues[session_key] == [first]
 
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""

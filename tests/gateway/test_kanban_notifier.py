@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import Mock
 
 
 from gateway.config import Platform
@@ -135,6 +136,67 @@ def test_kanban_db_path_is_test_isolated_from_real_home():
 
     assert kb.kanban_db_path().resolve().is_relative_to(hermes_home.resolve())
     assert kb.kanban_db_path().resolve() != production_db.resolve()
+
+
+def test_notify_subscription_persists_authorization_scope(tmp_path, monkeypatch):
+    db_path = tmp_path / "notify-scope.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="scoped", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="group",
+            external_origin=True,
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+    finally:
+        conn.close()
+
+    assert sub["chat_type"] == "group"
+    assert sub["external_origin"] == 1
+
+
+def test_external_no_user_subscriber_is_reauthorized_before_delivery(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "revoked-no-user.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="revoked", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            user_id=None,
+            chat_type="group",
+            external_origin=True,
+        )
+        kb.complete_task(conn, tid, summary="must not deliver")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    auth = Mock(return_value=False)
+    runner._is_user_authorized = auth
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    auth.assert_called_once()
+    assert auth.call_args.args[0].chat_type == "group"
+    assert auth.call_args.args[0].user_id is None
+    assert adapter.sent == []
+    assert _unseen_terminal_events(tid) == []
 
 
 class FailingAdapter:

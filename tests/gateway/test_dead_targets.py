@@ -113,6 +113,26 @@ async def test_forbidden_marks_target_dead_then_short_circuits(isolate):
 
 
 @pytest.mark.asyncio
+async def test_delivery_failure_redacts_secrets_from_result_and_registry(isolate):
+    secret = "sk-test-abcdefghijklmnopqrstuvwxyz123456"
+
+    class SecretBearingAdapter:
+        async def send(self, target, content, **kwargs):
+            raise RuntimeError(f"Forbidden: bearer {secret}")
+
+    router = DeliveryRouter(
+        GatewayConfig(), adapters={Platform.TELEGRAM: SecretBearingAdapter()}
+    )
+    target = DeliveryTarget.parse("telegram:84")
+
+    result = await router.deliver("hi", [target])
+    persisted = router.dead_targets.all_dead()["telegram:84"]["reason"]
+
+    assert secret not in result["telegram:84"]["error"]
+    assert secret not in persisted
+
+
+@pytest.mark.asyncio
 async def test_successful_send_clears_dead_flag(isolate):
     # Fails once (gets marked dead), then succeeds.
     adapter = ForbiddenThenOkAdapter(fail_times=1)

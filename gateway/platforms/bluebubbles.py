@@ -222,14 +222,28 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     async def _api_get(self, path: str) -> Dict[str, Any]:
         assert self.client is not None
-        res = await self.client.get(self._api_url(path))
-        res.raise_for_status()
+        try:
+            res = await self.client.get(self._api_url(path))
+            res.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"BlueBubbles API GET failed with HTTP {exc.response.status_code}"
+            ) from None
+        except httpx.RequestError:
+            raise RuntimeError("BlueBubbles API GET failed") from None
         return res.json()
 
     async def _api_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         assert self.client is not None
-        res = await self.client.post(self._api_url(path), json=payload)
-        res.raise_for_status()
+        try:
+            res = await self.client.post(self._api_url(path), json=payload)
+            res.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"BlueBubbles API POST failed with HTTP {exc.response.status_code}"
+            ) from None
+        except httpx.RequestError:
+            raise RuntimeError("BlueBubbles API POST failed") from None
         return res.json()
 
     # ------------------------------------------------------------------
@@ -870,6 +884,44 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 return candidate.strip()
         return None
 
+    def _webhook_sender_identity(
+        self, record: Dict[str, Any], payload: Dict[str, Any]
+    ) -> tuple[Optional[str], Optional[str], Optional[str], bool]:
+        """Extract stable routing identity before any attachment download."""
+        chat_guid = self._value(
+            record.get("chatGuid"),
+            payload.get("chatGuid"),
+            record.get("chat_guid"),
+            payload.get("chat_guid"),
+            payload.get("guid"),
+        )
+        if not chat_guid:
+            chats = record.get("chats") or []
+            if chats and isinstance(chats[0], dict):
+                chat_guid = chats[0].get("guid") or chats[0].get("chatGuid")
+        chat_identifier = self._value(
+            record.get("chatIdentifier"),
+            record.get("identifier"),
+            payload.get("chatIdentifier"),
+            payload.get("identifier"),
+        )
+        sender = (
+            self._value(
+                record.get("handle", {}).get("address")
+                if isinstance(record.get("handle"), dict)
+                else None,
+                record.get("sender"),
+                record.get("from"),
+                record.get("address"),
+            )
+            or chat_identifier
+            or chat_guid
+        )
+        if not (chat_guid or chat_identifier) and sender:
+            chat_identifier = sender
+        is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+        return chat_guid, chat_identifier, sender, is_group
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -931,8 +983,23 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             or ""
         )
 
+        chat_guid, chat_identifier, sender, is_group = (
+            self._webhook_sender_identity(record, payload)
+        )
+        session_chat_id = chat_guid or chat_identifier or ""
+        sender_authorized = self._is_sender_authorized(
+            sender,
+            "group" if is_group else "dm",
+            session_chat_id,
+        )
+
         # --- Inbound attachment handling ---
         attachments = record.get("attachments") or []
+        if sender_authorized is False:
+            # Preserve metadata/text intake for the pairing flow, but never
+            # let an unapproved human sender trigger network, memory, CPU, or
+            # disk work before the central gateway authorization decision.
+            attachments = []
         media_urls: List[str] = []
         media_types: List[str] = []
         msg_type = MessageType.TEXT
@@ -967,44 +1034,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             text = "(attachment)"
         # --- End attachment handling ---
 
-        chat_guid = self._value(
-            record.get("chatGuid"),
-            payload.get("chatGuid"),
-            record.get("chat_guid"),
-            payload.get("chat_guid"),
-            payload.get("guid"),
-        )
-        # Fallback: BlueBubbles v1.9+ webhook payloads omit top-level chatGuid;
-        # the chat GUID is nested under data.chats[0].guid instead.
-        if not chat_guid:
-            _chats = record.get("chats") or []
-            if _chats and isinstance(_chats[0], dict):
-                chat_guid = _chats[0].get("guid") or _chats[0].get("chatGuid")
-        chat_identifier = self._value(
-            record.get("chatIdentifier"),
-            record.get("identifier"),
-            payload.get("chatIdentifier"),
-            payload.get("identifier"),
-        )
-        sender = (
-            self._value(
-                record.get("handle", {}).get("address")
-                if isinstance(record.get("handle"), dict)
-                else None,
-                record.get("sender"),
-                record.get("from"),
-                record.get("address"),
-            )
-            or chat_identifier
-            or chat_guid
-        )
-        if not (chat_guid or chat_identifier) and sender:
-            chat_identifier = sender
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
 
         session_chat_id = chat_guid or chat_identifier
-        is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
         if is_group and self.require_mention:
             if not self._message_matches_mention_patterns(text):
                 logger.debug(

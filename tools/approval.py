@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import threading
@@ -1462,13 +1463,14 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             request_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    When *request_id* is provided, only the exact live request is resolved.
+    Otherwise, *resolve_all* resolves every pending approval in the session
+    (``/approve all``), and the legacy typed-command path remains FIFO.
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -1480,7 +1482,19 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if request_id is not None:
+            target_index = next(
+                (
+                    index
+                    for index, entry in enumerate(queue)
+                    if entry.data.get("request_id") == request_id
+                ),
+                None,
+            )
+            if target_index is None:
+                return 0
+            targets = [queue.pop(target_index)]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -2431,6 +2445,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    approval_data = dict(approval_data)
+    approval_data["request_id"] = secrets.token_urlsafe(18)
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")

@@ -2310,10 +2310,13 @@ def _get_pre_tool_call_directive_details(
         )
 
     if enforcement_hook_missing("pre_tool_call"):
-        return (
-            f"Tool '{tool_name}' blocked: governance is required for this "
-            "profile but its pre_tool_call enforcement hook is not registered. "
-            "Repair the governance plugin before running consequential actions."
+        return _PreToolCallDirective(
+            action="block",
+            message=(
+                f"Tool '{tool_name}' blocked: governance is required for this "
+                "profile but its pre_tool_call enforcement hook is not registered. "
+                "Repair the governance plugin before running consequential actions."
+            ),
         )
 
     try:
@@ -2330,10 +2333,13 @@ def _get_pre_tool_call_directive_details(
         )
     except GovernanceEnforcementError as exc:
         # Required governance could not evaluate this call — fail closed.
-        return (
-            f"Tool '{tool_name}' blocked: required governance enforcement "
-            f"was unavailable ({exc}). Repair the governance plugin before "
-            "retrying consequential actions."
+        return _PreToolCallDirective(
+            action="block",
+            message=(
+                f"Tool '{tool_name}' blocked: required governance enforcement "
+                f"was unavailable ({exc}). Repair the governance plugin before "
+                "retrying consequential actions."
+            ),
         )
 
     for result in hook_results:

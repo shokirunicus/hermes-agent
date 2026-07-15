@@ -453,6 +453,7 @@ def _handle_send(args):
                 from gateway.session_context import get_session_env
                 source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+                profile = get_session_env("HERMES_SESSION_PROFILE", "") or "main"
                 if mirror_to_session(
                     platform_name,
                     chat_id,
@@ -460,6 +461,7 @@ def _handle_send(args):
                     source_label=source_label,
                     thread_id=thread_id,
                     user_id=user_id,
+                    profile=profile,
                 ):
                     result["mirrored"] = True
             except Exception:

@@ -39,7 +39,15 @@ def _make_adapter():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._bot = AsyncMock()
     adapter._app = MagicMock()
+    adapter.set_authorization_check(lambda *_args: True)
     return adapter
+
+
+def _authorize_query(query, user_id: str = "owner"):
+    query.from_user = MagicMock()
+    query.from_user.id = user_id
+    query.message.chat.type = "private"
+    return query
 
 
 class TestTelegramModelPicker:
@@ -63,7 +71,7 @@ class TestTelegramModelPicker:
             current_provider="provider_one",
             session_key="s",
             on_model_selected=AsyncMock(),
-            metadata={"thread_id": "99999"},
+            metadata={"thread_id": "99999", "user_id": "owner"},
         )
 
         assert result.success is True
@@ -81,13 +89,14 @@ class TestTelegramModelPicker:
             "session_key": "s",
             "on_model_selected": AsyncMock(),
             "msg_id": 42,
+            "requester_user_id": "owner",
         }
 
         query = AsyncMock()
         query.data = "mb"
         query.message = MagicMock()
         query.message.chat_id = 12345
-        query.from_user = MagicMock()
+        _authorize_query(query)
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -118,12 +127,14 @@ class TestTelegramModelPicker:
             "selected_provider": "openai",
             "model_list": ["gpt-5"],
             "msg_id": 42,
+            "requester_user_id": "owner",
         }
 
         query = AsyncMock()
         query.data = "mm:0"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        _authorize_query(query)
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -184,7 +195,7 @@ class TestTelegramModelPicker:
             current_provider="minimax",
             session_key="s",
             on_model_selected=AsyncMock(),
-            metadata=None,
+            metadata={"user_id": "owner"},
         )
 
         assert "mpg:minimax" in built
@@ -196,6 +207,7 @@ class TestTelegramModelPicker:
         query = AsyncMock()
         query.message = MagicMock()
         query.message.chat_id = 12345
+        _authorize_query(query)
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -248,7 +260,7 @@ class TestTelegramModelPicker:
             current_provider="provider-0",
             session_key="s",
             on_model_selected=AsyncMock(),
-            metadata=None,
+            metadata={"user_id": "owner"},
         )
 
         def _callbacks(markup):
@@ -265,6 +277,7 @@ class TestTelegramModelPicker:
         query = AsyncMock()
         query.message = MagicMock()
         query.message.chat_id = 12345
+        _authorize_query(query)
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -296,6 +309,7 @@ class TestTelegramModelPicker:
             "selected_provider": "openrouter",
             "model_list": ["openai/gpt-5.5-pro"],
             "msg_id": 42,
+            "requester_user_id": "owner",
         }
         monkeypatch.setattr(
             "hermes_cli.model_cost_guard.expensive_model_warning",
@@ -307,6 +321,7 @@ class TestTelegramModelPicker:
         query = AsyncMock()
         query.message = MagicMock()
         query.message.chat_id = 12345
+        _authorize_query(query)
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
 
@@ -347,10 +362,36 @@ class TestTelegramModelPicker:
             current_provider="openai",
             session_key="s",
             on_model_selected=AsyncMock(),
-            metadata={"thread_id": "99999"},
+            metadata={"thread_id": "99999", "user_id": "owner"},
         )
 
         assert result.success is True
         assert len(call_log) == 2
         assert call_log[0]["message_thread_id"] == 99999
         assert "message_thread_id" not in call_log[1] or call_log[1]["message_thread_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_or_different_requester_cannot_use_picker(self):
+        adapter = _make_adapter()
+        callback = AsyncMock()
+        adapter._model_picker_state["12345"] = {
+            "providers": [],
+            "session_key": "s",
+            "on_model_selected": callback,
+            "current_model": "m",
+            "current_provider": "openai",
+            "requester_user_id": "owner",
+        }
+        adapter.set_authorization_check(lambda *_args: False)
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        _authorize_query(query, "owner")
+
+        await adapter._handle_model_picker_callback(query, "mp:openai", "12345")
+
+        query.answer.assert_awaited_once_with(
+            text="This picker belongs to another user."
+        )
+        callback.assert_not_awaited()

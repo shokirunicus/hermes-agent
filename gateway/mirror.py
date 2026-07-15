@@ -30,6 +30,7 @@ def mirror_to_session(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     role: str = "assistant",
+    profile: Optional[str] = None,
 ) -> bool:
     """
     Append a delivery-mirror message to the target session's transcript.
@@ -57,6 +58,7 @@ def mirror_to_session(
             str(chat_id),
             thread_id=thread_id,
             user_id=user_id,
+            profile=profile,
         )
         if not session_id:
             logger.debug(
@@ -98,6 +100,7 @@ def _find_session_id(
     chat_id: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> Optional[str]:
     """
     Find the active session_id for a platform + chat_id pair.
@@ -123,6 +126,7 @@ def _find_session_id(
                     chat_id=chat_id,
                     thread_id=thread_id,
                     user_id=user_id,
+                    profile=profile,
                 )
                 if session_id:
                     return str(session_id)
@@ -160,30 +164,50 @@ def _find_session_id(
             origin_thread_id = origin.get("thread_id")
             if thread_id is not None and str(origin_thread_id or "") != str(thread_id):
                 continue
-            candidates.append(entry)
+            session_key = str(entry.get("session_key") or _key)
+            parts = session_key.split(":")
+            entry_profile = (
+                parts[1]
+                if len(parts) >= 2 and parts[0] == "agent" and parts[1]
+                else None
+            )
+            if profile is not None and entry_profile != profile:
+                continue
+            candidates.append((entry, entry_profile))
 
     if not candidates:
         return None
 
+    if profile is None and len(candidates) > 1:
+        namespaces = {
+            entry_profile or "<legacy>" for _entry, entry_profile in candidates
+        }
+        if len(namespaces) > 1:
+            return None
+
+    candidate_entries = [entry for entry, _profile in candidates]
+
     if user_id:
         exact_user_matches = [
-            entry for entry in candidates
+            entry for entry in candidate_entries
             if str((entry.get("origin") or {}).get("user_id") or "") == str(user_id)
         ]
         if exact_user_matches:
-            candidates = exact_user_matches
-        elif len(candidates) > 1:
+            candidate_entries = exact_user_matches
+        elif len(candidate_entries) > 1:
             return None
-    elif len(candidates) > 1:
+    elif len(candidate_entries) > 1:
         distinct_user_ids = {
             str((entry.get("origin") or {}).get("user_id") or "").strip()
-            for entry in candidates
+            for entry in candidate_entries
             if str((entry.get("origin") or {}).get("user_id") or "").strip()
         }
         if len(distinct_user_ids) > 1:
             return None
 
-    best_entry = max(candidates, key=lambda entry: entry.get("updated_at", ""))
+    best_entry = max(
+        candidate_entries, key=lambda entry: entry.get("updated_at", "")
+    )
     return best_entry.get("session_id")
 
 

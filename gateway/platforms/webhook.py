@@ -449,6 +449,21 @@ class WebhookAdapter(BasePlatformAdapter):
             return _PROFILE_REJECTED
         return profile
 
+    @staticmethod
+    def _route_allows_profile(route_config: dict, profile: Optional[str]) -> bool:
+        """Require an explicit route-to-profile grant in multiplex mode."""
+        if not profile:
+            return True
+        allowed_profiles = route_config.get("profiles")
+        if not isinstance(allowed_profiles, list):
+            return False
+        normalized = {
+            str(candidate).strip()
+            for candidate in allowed_profiles
+            if str(candidate).strip()
+        }
+        return profile in normalized or "*" in normalized
+
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
         # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
@@ -467,6 +482,19 @@ class WebhookAdapter(BasePlatformAdapter):
         if not route_config:
             return web.json_response(
                 {"error": f"Unknown route: {route_name}"}, status=404
+            )
+
+        if isinstance(profile, str) and not self._route_allows_profile(
+            route_config, profile
+        ):
+            logger.warning(
+                "[webhook] Route %s is not authorized for profile %s",
+                route_name,
+                profile,
+            )
+            return web.json_response(
+                {"error": "Route is not authorized for this profile"},
+                status=403,
             )
 
         # Disabled routes are kept in the subscriptions file (so the dashboard

@@ -5269,6 +5269,38 @@ def test_find_session_by_origin_matching_rules(db):
     ) is None
 
 
+def test_find_session_by_origin_does_not_cross_profile_namespace(db):
+    db.create_session(
+        "gw-main", "telegram", user_id="u1",
+        session_key="agent:main:telegram:dm:c1", chat_id="c1", chat_type="dm",
+    )
+    db.create_session(
+        "gw-coder", "telegram", user_id="u1",
+        session_key="agent:coder:telegram:dm:c1", chat_id="c1", chat_type="dm",
+    )
+
+    assert db.find_session_by_origin(
+        platform="telegram", chat_id="c1", user_id="u1"
+    ) == "gw-main"
+    assert db.find_session_by_origin(
+        platform="telegram", chat_id="c1", user_id="u1", profile="coder"
+    ) == "gw-coder"
+
+
+def test_find_session_by_origin_omitted_profile_rejects_lone_secondary(db):
+    db.create_session(
+        "gw-coder", "telegram", user_id="u1",
+        session_key="agent:coder:telegram:dm:c1", chat_id="c1", chat_type="dm",
+    )
+
+    assert db.find_session_by_origin(
+        platform="telegram", chat_id="c1", user_id="u1"
+    ) is None
+    assert db.find_session_by_origin(
+        platform="telegram", chat_id="c1", user_id="u1", profile="coder"
+    ) == "gw-coder"
+
+
 def test_v18_backfill_from_sessions_json(tmp_path, monkeypatch):
     """Migration backfills display_name/origin_json/expiry_finalized from sessions.json."""
     import hermes_state as hs

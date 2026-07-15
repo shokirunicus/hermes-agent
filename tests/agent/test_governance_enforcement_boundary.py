@@ -405,9 +405,7 @@ def test_nested_dispatch_inherits_ambient_session_and_turn(monkeypatch):
         captured.update(kw, tool_name=tool_name)
         return None
 
-    monkeypatch.setattr(
-        "hermes_cli.plugins.get_pre_tool_call_block_message", _capture_block
-    )
+    monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", _capture_block)
     with model_tools.dispatch_context(session_id="sess-9", turn_id="turn-7"):
         model_tools.handle_function_call("noop_probe", {}, "task-1")
     assert captured.get("session_id") == "sess-9"
@@ -424,9 +422,7 @@ def test_outer_dispatch_seeds_ambient_context_for_nested_calls(monkeypatch):
         captured.append((tool_name, kw.get("session_id"), kw.get("turn_id")))
         return None
 
-    monkeypatch.setattr(
-        "hermes_cli.plugins.get_pre_tool_call_block_message", _capture_block
-    )
+    monkeypatch.setattr("hermes_cli.plugins.resolve_pre_tool_block", _capture_block)
 
     def _outer_handler(args, **kw):
         # simulate the sandbox proxy: a nested dispatch with only task_id
