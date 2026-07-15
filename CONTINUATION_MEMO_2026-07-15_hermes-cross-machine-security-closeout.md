@@ -17,8 +17,11 @@ Close the Hermes 0.18.2 integration work without interrupting a running Hermes s
 
 - Working branch: `chore/hdev-v0.18.2-integration`
 - Runtime and security commit: `52e30bbc9`
-- Intended destination: the user fork's `main` branch through a Draft PR
+- Review PR: `https://github.com/shokirunicus/hermes-agent/pull/1`
+- Review base: `integration/v0.18.2-base` at the v0.18.2 release commit
+- Intended production destination remains the user fork's `main` branch after a separate upstream-port pass.
 - Upstream is retained as the read-only integration source; do not open this private operational closeout directly against upstream.
+- Current upstream is 685 commits ahead of the release base. A read-only merge simulation found seven content conflicts, so this closeout did not invalidate the verified diff with a late bulk merge.
 - Two unrelated, older untracked G100 orchestration files were excluded from this change and moved to a temporary archive before commit. Do not recreate or include them without a separate scope decision.
 
 ## Implemented behavior
@@ -84,6 +87,6 @@ Close the Hermes 0.18.2 integration work without interrupting a running Hermes s
 
 ## Closeout references
 
-- Draft PR: pending creation after this memo commit.
-- Branch push: pending this memo commit.
+- Draft PR: `https://github.com/shokirunicus/hermes-agent/pull/1` (open, mergeable against the fixed review base, checks queued at recording time).
+- Branch push: completed to the user fork.
 - Shared workspace handoff: created during final closeout and referenced from the workspace index.
