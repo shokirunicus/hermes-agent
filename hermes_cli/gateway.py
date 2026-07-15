@@ -3540,6 +3540,11 @@ _LAUNCHD_JOB_UNLOADED_EXIT_CODES = frozenset({3, 113, 125})
 # unsupported (case 2) via `_launchctl_domain_unsupported`.
 _LAUNCHCTL_DOMAIN_UNSUPPORTED_CODES = frozenset({5, 125})
 
+# A launchctl EIO/125 can outlive the immediate bootout/bootstrap retry under
+# load even though the user domain still supports launchd. Give that transient
+# race a bounded recovery window before accepting unsupervised fallback mode.
+_LAUNCHD_TRANSIENT_RECOVERY_SECONDS = 30.0
+
 
 def _launchd_error_indicates_unloaded(exc: subprocess.CalledProcessError) -> bool:
     """True when launchctl failed because the job isn't loaded (retry bootstrap)."""
@@ -4155,12 +4160,25 @@ def launchd_start():
                 timeout=30,
             )
         except subprocess.CalledProcessError as e2:
-            # Even a fresh bootstrap can't manage the domain on this host —
-            # degrade to a detached background process (issue #23387).
             if not _launchctl_domain_unsupported(e2.returncode):
                 raise
-            _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
-            return
+            # A second immediate EIO/125 can still be a transient launchd
+            # race under load. Retry registration before surrendering
+            # supervision and starting a detached fallback process.
+            recovered = _retry_launchctl_bootstrap_until_registered(
+                _launchd_domain(),
+                plist_path,
+                label,
+                deadline=time.monotonic() + _LAUNCHD_TRANSIENT_RECOVERY_SECONDS,
+            )
+            if not recovered:
+                _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
+                return
+            subprocess.run(
+                ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+                check=True,
+                timeout=30,
+            )
     print("✓ Service started")
     _clear_launchd_unsupported_marker()
 
@@ -4285,16 +4303,14 @@ def launchd_restart():
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:
-        if not _launchd_error_indicates_unloaded(e):
-            # Not a "job unloaded" code. If the domain is fundamentally
-            # unmanageable (error 5), degrade to detached; the old process was
-            # already drained/terminated above. Otherwise re-raise.
-            if _launchctl_domain_unsupported(e.returncode):
-                _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
-                return
+        if not (
+            _launchd_error_indicates_unloaded(e)
+            or _launchctl_domain_unsupported(e.returncode)
+        ):
             raise
-        # Job not loaded — bootstrap and start fresh
-        print("↻ launchd job was unloaded; reloading")
+        # Job not loaded, or launchctl returned a potentially transient EIO.
+        # Re-register before accepting a detached, unsupervised fallback.
+        print("↻ launchd job was unavailable; reloading")
         plist_path = get_launchd_plist_path()
         try:
             # Restart is the one path where the job is almost always still
@@ -4307,17 +4323,25 @@ def launchd_restart():
                 check=False,
                 timeout=90,
             )
-            subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-                check=True,
-                timeout=30,
+            _launchctl_bootstrap(
+                _launchd_domain(), plist_path, label, timeout=30
             )
             subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         except subprocess.CalledProcessError as e2:
             if not _launchctl_domain_unsupported(e2.returncode):
                 raise
-            _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
-            return
+            recovered = _retry_launchctl_bootstrap_until_registered(
+                _launchd_domain(),
+                plist_path,
+                label,
+                deadline=time.monotonic() + _LAUNCHD_TRANSIENT_RECOVERY_SECONDS,
+            )
+            if not recovered:
+                _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
+                return
+            subprocess.run(
+                ["launchctl", "kickstart", target], check=True, timeout=30
+            )
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
 
