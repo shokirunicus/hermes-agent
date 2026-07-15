@@ -17,6 +17,7 @@ Close the Hermes 0.18.2 integration work without interrupting a running Hermes s
 
 - Working branch: `chore/hdev-v0.18.2-integration`
 - Runtime and security commit: `52e30bbc9`
+- CI remediation commit: `eaa1908fb`
 - Review PR: `https://github.com/shokirunicus/hermes-agent/pull/1`
 - Review base: `integration/v0.18.2-base` at the v0.18.2 release commit
 - Intended production destination remains the user fork's `main` branch after a separate upstream-port pass.
@@ -59,6 +60,8 @@ Close the Hermes 0.18.2 integration work without interrupting a running Hermes s
 - Repository-wide parallel suite: 39,359 passed and 113 failed across 1,930 files. The failures are outside the intended behavior and cluster around missing optional ACP support, operating-system process guards, local provider state, network/catalog access, and timing-sensitive process tests. One stale dependency expectation related to this diff was found, fixed, and re-tested.
 - Final wheel built successfully. SHA-256: `c2ce46aaea967508ec230ac3656302f11f25042dc02e3f3c04b44d0eea7f0d7b`.
 - Repository-wide formatter check reports broad pre-existing drift. Do not bulk-format this branch; lint passes and the diff stays scoped.
+- The first PR CI run exposed two inherited integration defects: cleanup-order expectations lagged the security-motivated finalizer order, and an explicit nested-dispatch identity leaked into the next unrelated call. The expectation was updated, dispatch identity is now scoped and reset, and the 35-test focused regression set passes.
+- The user fork's `main` branch was fast-forwarded to current upstream so contributor attribution CI no longer compares the PR against an obsolete fork history.
 
 ## Runtime state
 
@@ -87,6 +90,6 @@ Close the Hermes 0.18.2 integration work without interrupting a running Hermes s
 
 ## Closeout references
 
-- Draft PR: `https://github.com/shokirunicus/hermes-agent/pull/1` (open, mergeable against the fixed review base, checks queued at recording time).
+- Draft PR: `https://github.com/shokirunicus/hermes-agent/pull/1` (open and mergeable against the fixed review base; final CI rerun pending at recording time).
 - Branch push: completed to the user fork.
 - Shared workspace handoff: created during final closeout and referenced from the workspace index.
