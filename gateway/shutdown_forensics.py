@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from agent.redact import redact_sensitive_text
 
 
 _SIGNAL_NAME_BY_NUM: Dict[int, str] = {}
@@ -67,7 +70,27 @@ def _read_proc_cmdline(pid: int) -> Optional[str]:
     if not data:
         return None
     # cmdline uses NUL separators
-    return data.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    decoded = data.replace(b"\x00", b" ").decode(
+        "utf-8", errors="replace"
+    ).strip()
+    return redact_sensitive_text(decoded, force=True)
+
+
+def _redact_context_value(value: Any) -> Any:
+    """Recursively redact strings before shutdown context is logged."""
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_context_value(item) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_context_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_context_value(item) for item in value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return redact_sensitive_text(str(value), force=True)
 
 
 def _proc_summary(pid: int) -> Dict[str, Any]:
@@ -229,10 +252,10 @@ def spawn_async_diagnostic(
     script = (
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
+        "echo '--- process summary (first 60) ---'; "
+        "ps -eo pid,ppid,user,stat,pcpu,pmem,comm 2>/dev/null | head -60; "
         "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
+        f"pstree -pl {os.getpid()} 2>/dev/null | head -40 || true; "
         "echo '--- /proc/loadavg ---'; "
         "cat /proc/loadavg 2>/dev/null || true; "
         "echo '--- recent dmesg (oom/killed) ---'; "
@@ -244,9 +267,17 @@ def spawn_async_diagnostic(
         # Open the log file in append mode and let the subprocess inherit.
         # We use os.O_APPEND so concurrent diagnostics from rapid signals
         # don't trample each other.
-        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)
     except OSError:
         return None
+
+    timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+    command = (
+        [timeout_bin, f"{timeout_seconds:.0f}", "bash", "-c", script]
+        if timeout_bin
+        else ["bash", "-c", script]
+    )
 
     try:
         # Detach from our process group so the subprocess survives even
@@ -255,7 +286,7 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            command,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -282,7 +313,9 @@ def format_context_for_log(ctx: Dict[str, Any]) -> str:
     """Render a shutdown context dict as a single, scannable log line."""
     sig = ctx.get("signal", "?")
     parent = ctx.get("parent") or {}
-    parent_cmd = parent.get("cmdline", "(unknown)")
+    parent_cmd = redact_sensitive_text(
+        str(parent.get("cmdline", "(unknown)")), force=True
+    )
     parent_name = parent.get("name") or "?"
     parent_pid = parent.get("pid") or "?"
     under_systemd = "yes" if ctx.get("under_systemd") else "no"
@@ -314,7 +347,9 @@ def format_context_for_log(ctx: Dict[str, Any]) -> str:
 def context_as_json(ctx: Dict[str, Any]) -> str:
     """JSON-serialise a context dict for structured ingestion.  Never raises."""
     try:
-        return json.dumps(ctx, default=str, sort_keys=True)
+        return json.dumps(
+            _redact_context_value(ctx), default=str, sort_keys=True
+        )
     except (TypeError, ValueError):
         return "{}"
 

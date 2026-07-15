@@ -6534,6 +6534,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                metadata={"reauthorize_source": True},
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -6941,7 +6942,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter.set_authorization_check(
+                self._make_adapter_auth_check(
+                    adapter.platform, profile=self._active_profile_name()
+                )
+            )
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -8457,7 +8462,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter.set_authorization_check(
+                self._make_adapter_auth_check(
+                    adapter.platform, profile=profile_name
+                )
+            )
             adapter._busy_text_mode = self._busy_text_mode
 
             try:
@@ -8634,6 +8643,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _make_adapter_auth_check(
         self,
         platform: Platform,
+        *,
+        profile: Optional[str] = None,
     ) -> Callable[[str, Optional[str], Optional[str]], bool]:
         """Build a platform-bound auth callback for adapter use.
 
@@ -8659,6 +8670,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=chat_id or "",
                 chat_type=chat_type or "group",
                 user_id=user_id,
+                profile=profile,
             )
             return self._is_user_authorized(source)
         return check
@@ -8793,7 +8805,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
         if is_internal:
-            pass
+            # Synthetic events derived from an external source must not
+            # preserve that source's authority after revocation. Some valid
+            # chat-scoped sources have no user identity (for example Telegram
+            # anonymous administrators), so provenance is explicit instead of
+            # inferred solely from user_id. Truly local/system events retain
+            # the existing trusted internal path.
+            requires_reauthorization = bool(
+                (event.metadata or {}).get("reauthorize_source")
+            ) or bool(getattr(source, "user_id", None))
+            if requires_reauthorization:
+                try:
+                    if not self._is_user_authorized(source):
+                        logger.warning(
+                            "Dropping internal event for unauthorized source: %s",
+                            source.chat_id,
+                        )
+                        return None
+                except Exception as exc:
+                    logger.warning(
+                        "Dropping internal event after authorization check failure: %s",
+                        exc,
+                    )
+                    return None
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
             # channel forwards, anonymous admin posts, sender_chat) can't
@@ -12153,7 +12187,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
-        policy = _policy_for_source(self.config, source)
+        policy_config = self.config
+        if (
+            getattr(self.config, "multiplex_profiles", False)
+            and source.profile
+        ):
+            try:
+                from gateway.config import load_gateway_config
+
+                with _profile_runtime_scope(
+                    self._resolve_profile_home_for_source(source)
+                ):
+                    policy_config = load_gateway_config()
+            except Exception:
+                logger.warning(
+                    "Slash access config lookup failed for profile %s; denying",
+                    source.profile,
+                    exc_info=True,
+                )
+                return "⛔ Slash command authorization could not be verified."
+        policy = _policy_for_source(policy_config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
@@ -15138,6 +15191,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
+                metadata={"reauthorize_source": True},
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -15331,6 +15385,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 source=source,
                                 internal=True,
                                 message_id=message_id,
+                                metadata={"reauthorize_source": True},
                             )
                             logger.info(
                                 "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
@@ -18299,13 +18354,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_metadata = dict(_status_thread_metadata or {})
+                        _approval_metadata["approval_request_id"] = str(
+                            approval_data.get("request_id") or ""
+                        )
                         _approval_fut = safe_schedule_threadsafe(
                             _status_adapter.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata,
                             ),
                             _loop_for_step,
                             logger=logger,

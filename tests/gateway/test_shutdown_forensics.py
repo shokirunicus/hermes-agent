@@ -145,6 +145,16 @@ class TestFormatters:
         assert decoded["signal"] == "SIGTERM"
         assert "weird" in decoded
 
+    def test_context_outputs_redact_command_line_secrets(self):
+        secret = "sk-" + "proj-" + "12345678901234567890"
+        ctx = {
+            "signal": "SIGTERM",
+            "parent": {"pid": 42, "name": "launcher", "cmdline": secret},
+        }
+
+        assert secret not in sf.format_context_for_log(ctx)
+        assert secret not in sf.context_as_json(ctx)
+
 
 # ---------------------------------------------------------------------------
 # spawn_async_diagnostic
@@ -173,6 +183,7 @@ class TestSpawnAsyncDiagnostic:
             pass
 
         assert log_path.exists()
+        assert log_path.stat().st_mode & 0o077 == 0
         contents = log_path.read_text(encoding="utf-8", errors="replace")
         assert "shutdown diagnostic" in contents
         assert "SIGTERM" in contents

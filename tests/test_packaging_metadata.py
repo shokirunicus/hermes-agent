@@ -433,6 +433,8 @@ _REQUIRED_SECURITY_PINS = {
         "platform.matrix",
         "platform.teams",
     },
+    "PyNaCl": {"platform.discord"},
+    "davey": {"platform.discord"},
 }
 
 

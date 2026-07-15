@@ -101,6 +101,24 @@ def test_secondary_allowlist_still_authorized(monkeypatch):
     assert runner._is_user_authorized(source) is True
 
 
+def test_adapter_authorization_callback_stamps_profile(monkeypatch):
+    """Per-profile adapters must authorize inside their own profile scope."""
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(
+        monkeypatch
+    )
+    seen = []
+    monkeypatch.setattr(
+        runner,
+        "_is_user_authorized",
+        lambda source: seen.append(source) or True,
+    )
+
+    check = runner._make_adapter_auth_check(Platform.WECOM, profile="coder")
+
+    assert check("allowed-user", "dm", "dm-chat") is True
+    assert seen[0].profile == "coder"
+
+
 def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
     """Ingress adapter lookup must use the stamped profile's adapter map."""
     runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
@@ -157,3 +175,70 @@ def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     assert violation is not None
     assert "wecom" in violation
     assert "open policy" in violation
+
+
+def test_secondary_authorization_reads_only_its_profile_env(
+    monkeypatch, tmp_path
+):
+    runner, _default_adapter, secondary_adapter = _make_multiplex_runner(
+        monkeypatch
+    )
+    secondary_adapter._dm_policy = "allowlist"
+    monkeypatch.setenv("WECOM_ALLOWED_USERS", "default-owner")
+    profile_home = tmp_path / "coder"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "WECOM_ALLOWED_USERS=coder-owner\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        runner, "_resolve_profile_home_for_source", lambda _source: profile_home
+    )
+
+    coder_source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="coder-owner",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="coder",
+    )
+    default_source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="default-owner",
+        chat_id="dm-chat",
+        chat_type="dm",
+    )
+
+    assert runner._is_user_authorized(coder_source) is True
+    assert runner._is_user_authorized(default_source) is True
+
+
+def test_simplex_display_name_does_not_match_global_allowlist(monkeypatch):
+    from gateway.platform_registry import PlatformEntry, platform_registry
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    platform_registry.register(PlatformEntry(
+        name="simplex",
+        label="SimpleX Chat",
+        adapter_factory=lambda _cfg: None,
+        check_fn=lambda: True,
+        allowed_users_env="SIMPLEX_ALLOWED_USERS",
+        allow_all_env="SIMPLEX_ALLOW_ALL_USERS",
+    ))
+    simplex = Platform("simplex")
+    monkeypatch.delenv("SIMPLEX_ALLOWED_USERS", raising=False)
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "same-display-name")
+
+    source = SessionSource(
+        platform=simplex,
+        user_id="different-contact-id",
+        user_name="same-display-name",
+        chat_id="dm-chat",
+        chat_type="dm",
+    )
+
+    assert runner._is_user_authorized(source) is False

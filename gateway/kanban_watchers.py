@@ -311,6 +311,56 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
+                    raw_external_origin = sub.get("external_origin")
+                    external_origin = (
+                        platform_str != "tui"
+                        if raw_external_origin is None
+                        else bool(raw_external_origin)
+                    )
+                    source_chat_type = str(sub.get("chat_type") or "").strip().lower()
+                    # A notification subscription is durable routing state,
+                    # not a durable authorization grant. Re-check the live
+                    # caller policy before any terminal output crosses the
+                    # adapter boundary; revoked or unresolvable sources are
+                    # consumed without delivery so they cannot replay forever.
+                    try:
+                        from gateway.session import SessionSource
+
+                        if external_origin and not source_chat_type:
+                            logger.warning(
+                                "kanban notifier: skipping legacy external subscriber "
+                                "without authorization scope %s/%s",
+                                platform_str,
+                                sub["chat_id"],
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            continue
+                        _notify_source = SessionSource(
+                            platform=plat,
+                            chat_id=sub["chat_id"],
+                            chat_type=source_chat_type or "group",
+                            thread_id=sub.get("thread_id") or None,
+                            user_id=sub.get("user_id") or None,
+                            profile=sub_profile or None,
+                        )
+                        if external_origin and not self._is_user_authorized(_notify_source):
+                            logger.warning(
+                                "kanban notifier: skipping revoked subscriber %s/%s",
+                                platform_str,
+                                sub["chat_id"],
+                            )
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            continue
+                    except Exception as exc:
+                        logger.warning("kanban notifier: authorization check failed: %s", exc)
+                        await asyncio.to_thread(
+                            self._kanban_advance, sub, d["cursor"], board_slug,
+                        )
+                        continue
                     # Route via the SAME chokepoint the authorization path uses
                     # (gateway/authz_mixin.py::_authorization_adapter): a stamped
                     # profile with its own adapter-registry entry must be served
@@ -515,26 +565,13 @@ class GatewayKanbanWatchersMixin:
                                     from gateway.session import SessionSource
                                     from gateway.platforms.base import MessageEvent, MessageType
                                     # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
+                                    # Reuse the persisted authorization scope so
+                                    # the wake lands in the same DM/group/thread
+                                    # namespace as the originating subscription.
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
-                                        chat_type="group",
+                                        chat_type=source_chat_type or "group",
                                         thread_id=sub.get("thread_id") or None,
                                         user_id=sub.get("user_id"),
                                         profile=sub_profile or None,
@@ -544,6 +581,9 @@ class GatewayKanbanWatchersMixin:
                                         message_type=MessageType.TEXT,
                                         source=_source,
                                         internal=True,
+                                        metadata={
+                                            "reauthorize_source": external_origin,
+                                        },
                                     )
                                     await adapter.handle_message(_synth_event)
                                     logger.info(

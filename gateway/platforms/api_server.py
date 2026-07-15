@@ -2525,6 +2525,11 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+            # Keep the streaming Chat Completions path consistent with every
+            # other API response path: provider/agent errors are untrusted
+            # text and must be redacted before they enter client-visible SSE.
+            if err_msg:
+                err_msg = _redact_api_error_text(err_msg)
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.

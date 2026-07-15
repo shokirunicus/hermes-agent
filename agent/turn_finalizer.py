@@ -8,11 +8,10 @@ budget-exhaustion summary, trajectory save, session persist, turn diagnostics,
 response transforms, result-dict assembly, steer drain, and the memory/skill
 review trigger.
 
-Behavior-neutral: the body is moved unchanged. All ``agent.*`` side effects fire
-exactly as before; only the post-loop *locals* are passed in as keyword args, and
-the assembled ``result`` dict is returned to ``run_conversation`` which returns it
-to the caller. The function is synchronous with a single return — mirroring the
-region it replaces (no awaits, no early returns).
+Originally extracted as behavior-neutral code, this module now also owns the
+accepted-response ordering contract: output transforms complete before session and
+trajectory persistence. All post-loop operations remain synchronous, and the
+assembled ``result`` dict is returned to ``run_conversation``.
 
 Module ``logger`` is imported lazily inside the body (``from
 agent.conversation_loop import logger``) so this module never imports
@@ -25,6 +24,53 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+
+
+def enforce_direct_final(agent, text, *, turn_id="", user_message=""):
+    """Apply the transform gate to a final delivered outside ``finalize_turn``.
+
+    A handful of recovery paths (e.g. the truncation-partial return) hand
+    model-generated text straight back to the caller. Under required
+    governance that text must pass the same transform gate as a normal
+    final; on gate failure it is replaced, never delivered raw.
+    """
+    if not text:
+        return text
+    from agent.conversation_loop import logger
+
+    _required = False
+    try:
+        from hermes_cli.plugins import required_enforcement_active
+
+        _required = required_enforcement_active()
+    except Exception:
+        _required = False
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        for _hook_result in invoke_hook(
+            "transform_llm_output",
+            response_text=text,
+            session_id=agent.session_id or "",
+            turn_id=turn_id or "",
+            user_message=user_message or "",
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        ):
+            if isinstance(_hook_result, str) and _hook_result:
+                return _hook_result
+    except Exception as exc:
+        if _required:
+            from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+
+            logger.error(
+                "direct-final transform failed under required governance; "
+                "failing closed: %s",
+                exc,
+            )
+            return GOVERNANCE_FAIL_CLOSED_RESPONSE
+        logger.warning("direct-final transform failed: %s", exc)
+    return text
 
 
 def finalize_turn(
@@ -145,69 +191,12 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
-
     # Clean up VM and browser for this task after conversation completes
     try:
         agent._cleanup_task_resources(effective_task_id)
     except Exception as _cleanup_err:
         _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
         logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
-
-    # Persist session to both JSON log and SQLite only after private retry
-    # scaffolding has been removed. Otherwise a later user "continue" turn
-    # can replay assistant("(empty)") / recovery nudges and fall into the
-    # same empty-response loop again.
-    try:
-        agent._drop_trailing_empty_response_scaffolding(messages)
-
-        # When the turn was interrupted and the last message is a tool
-        # result, append a synthetic assistant message to close the
-        # tool-call sequence. Without this, the session persists a
-        # ``tool → user`` alternation that strict providers (Gemini,
-        # Claude) reject, causing them to hallucinate a continuation of
-        # the user's message on the next turn (#48879).
-        #
-        # ``_drop_trailing_empty_response_scaffolding`` only rewinds the
-        # tool tail when an empty-response scaffolding flag is present; a
-        # clean ``/stop`` interrupt after a successful tool sets no such
-        # flag, so the tool result survives as the tail and we close it
-        # here instead. On an interrupt ``final_response`` is typically
-        # empty, so fall back to an explicit placeholder rather than
-        # persisting an empty-content assistant turn.
-        if interrupted:
-            from agent.message_sanitization import close_interrupted_tool_sequence
-            close_interrupted_tool_sequence(messages, final_response)
-
-        # Some recovery/fallback paths return a real final_response without
-        # adding a closing assistant message to the transcript (e.g. the
-        # partial-stream and prior-turn-content recovery ``break`` sites in
-        # ``conversation_loop``). If persisted as-is, the durable session can
-        # end at a tool/user message even though the caller — and the gateway
-        # platform — already saw a completed assistant response. The next turn
-        # then replays a user-only backlog and the model re-answers every
-        # "unanswered" message. Close the durable turn at the source, at the
-        # single chokepoint every recovery ``break`` flows through, so the
-        # invariant "delivered final_response ⇒ assistant row in transcript"
-        # holds regardless of which path produced it. (#43849 / #44100)
-        if final_response and not interrupted:
-            try:
-                _tail_role = messages[-1].get("role") if messages else None
-            except Exception:
-                _tail_role = None
-            if _tail_role != "assistant":
-                messages.append({"role": "assistant", "content": final_response})
-
-        agent._persist_session(messages, conversation_history)
-    except Exception as _persist_err:
-        _cleanup_errors.append(f"persist_session: {_persist_err}")
-        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -335,18 +324,51 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _required_enforcement = False
+    _transform_hook_missing = False
+    try:
+        from hermes_cli.plugins import (
+            enforcement_hook_missing as _ehm,
+            required_enforcement_active as _rea,
+        )
+
+        _required_enforcement = _rea()
+        _transform_hook_missing = _ehm("transform_llm_output")
+    except Exception:
+        # A profile that truly requires governance already refused to start
+        # if the plugin layer is unloadable (validate_required_plugins).
+        _required_enforcement = False
+
+    if _transform_hook_missing and final_response:
+        # Governance is required but its transform gate is not registered —
+        # deliver the fail-closed replacement, never the ungoverned draft.
+        # Covers interrupted partials too: _transform_hook_missing already
+        # implies required enforcement, and an interrupt must not become a
+        # delivery path for ungoverned text — matching the invoke condition
+        # below (2026-07-14 review, P1; interrupted gap found in wrap-up review).
+        from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+
+        logger.error(
+            "transform_llm_output required but not registered; failing closed"
+        )
+        final_response = GOVERNANCE_FAIL_CLOSED_RESPONSE
+        _response_transformed = True
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    # Under required governance the gate also covers interrupted partials —
+    # an interrupt must not become a delivery path for ungoverned text.
+    if final_response and (not interrupted or _required_enforcement):
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
+                turn_id=turn_id or "",
+                user_message=original_user_message or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
@@ -356,7 +378,57 @@ def finalize_turn(
                     _response_transformed = True
                     break  # First non-empty string wins
         except Exception as exc:
-            logger.warning("transform_llm_output hook failed: %s", exc)
+            if _required_enforcement:
+                # Required governance could not examine the final text —
+                # deliver the fail-closed replacement, never the raw draft.
+                from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+
+                logger.error(
+                    "transform_llm_output failed under required governance; "
+                    "failing closed: %s",
+                    exc,
+                )
+                final_response = GOVERNANCE_FAIL_CLOSED_RESPONSE
+                _response_transformed = True
+            else:
+                logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # Persist only the accepted, post-transform response. A governance or
+    # redaction transform must not show one answer to the caller while leaving
+    # the rejected candidate in durable history.
+    try:
+        agent._drop_trailing_empty_response_scaffolding(messages)
+
+        if interrupted:
+            from agent.message_sanitization import close_interrupted_tool_sequence
+            close_interrupted_tool_sequence(messages, final_response)
+
+        if final_response and not interrupted:
+            try:
+                _tail_role = messages[-1].get("role") if messages else None
+            except Exception:
+                _tail_role = None
+            if _tail_role == "assistant" and _response_transformed:
+                messages[-1]["content"] = final_response
+            elif _tail_role != "assistant":
+                messages.append({"role": "assistant", "content": final_response})
+
+        agent._persist_session(messages, conversation_history)
+    except Exception as _persist_err:
+        _cleanup_errors.append(f"persist_session: {_persist_err}")
+        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
+    # Save trajectory only after response transformation and transcript cleanup,
+    # so rejected governance drafts cannot survive in a secondary durable log.
+    try:
+        agent._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+        )
+    except Exception as _save_err:
+        _cleanup_errors.append(f"save_trajectory: {_save_err}")
+        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.

@@ -35,6 +35,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -81,10 +82,18 @@ def _ws_dial_url(url: str) -> str:
     configured WITH the scheme and/or ``/relay`` still works.
     """
     raw = (url or "").strip()
-    if raw.startswith("https://"):
-        raw = "wss://" + raw[len("https://"):]
-    elif raw.startswith("http://"):
-        raw = "ws://" + raw[len("http://"):]
+    parsed = urlsplit(raw)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "ws", "wss"}:
+        raise ValueError("relay endpoint scheme must be http, https, ws, or wss")
+    dial_scheme = {"http": "ws", "https": "wss"}.get(scheme, scheme)
+    raw = parsed._replace(scheme=dial_scheme).geturl()
+    if dial_scheme == "ws":
+        host = (parsed.hostname or "").lower()
+        if host not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError(
+                "non-loopback relay endpoints must use https:// or wss://"
+            )
     raw = raw.rstrip("/")
     if not raw.endswith("/relay"):
         raw = f"{raw}/relay"
@@ -699,7 +708,14 @@ class WebSocketRelayTransport:
             handler = getattr(self, "_passthrough_handler", None)
             if handler is not None:
                 fwd = _passthrough_from_wire(frame.get("forward", {}))
-                await handler(fwd, frame.get("bufferId"))
+                buffer_id = frame.get("bufferId")
+                handled = await handler(fwd, buffer_id)
+                # The connector retains buffered passthrough work until the
+                # gateway confirms durable handling.  Preserve redelivery on
+                # handler failure; acknowledge successful handling or an
+                # intentional durable drop of an unsupported payload.
+                if buffer_id and handled is not False:
+                    await self._send_inbound_ack(str(buffer_id))
         else:
             # hello/outbound/interrupt are gateway->connector; ignore if echoed.
             pass

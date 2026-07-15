@@ -1854,6 +1854,7 @@ class SessionDB:
         chat_id: str,
         thread_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        profile: Optional[str] = None,
     ) -> Optional[str]:
         """Find the most recent live session_id for a platform + chat origin.
 
@@ -1866,7 +1867,7 @@ class SessionDB:
         if not platform or chat_id in (None, ""):
             return None
         query = """
-            SELECT id, user_id, started_at FROM sessions
+            SELECT id, user_id, session_key, started_at FROM sessions
             WHERE LOWER(source) = LOWER(?)
               AND session_key IS NOT NULL
               AND chat_id = ?
@@ -1879,6 +1880,26 @@ class SessionDB:
         query += " ORDER BY started_at DESC"
         with self._lock:
             rows = [dict(r) for r in self._conn.execute(query, params).fetchall()]
+        if not rows:
+            return None
+        for row in rows:
+            parts = str(row.get("session_key") or "").split(":")
+            row["_profile"] = (
+                parts[1]
+                if len(parts) >= 2 and parts[0] == "agent" and parts[1]
+                else None
+            )
+        # The historical/default gateway namespace is ``main``. Treat an
+        # omitted profile as that namespace rather than allowing a lone row
+        # from any secondary profile to cross the isolation boundary. Legacy
+        # pre-profile rows remain eligible only for the default namespace.
+        requested_profile = profile or "main"
+        rows = [
+            row
+            for row in rows
+            if row.get("_profile") == requested_profile
+            or (requested_profile == "main" and row.get("_profile") is None)
+        ]
         if not rows:
             return None
         if user_id:

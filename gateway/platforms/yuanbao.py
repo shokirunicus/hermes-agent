@@ -3285,6 +3285,8 @@ class ConnectionManager:
         # Debounce buffer for aggregating multi-part inbound messages
         self._inbound_buffer: Dict[str, list] = {}  # key -> [raw_data_frames, ...]
         self._inbound_timers: Dict[str, asyncio.TimerHandle] = {}  # key -> timer
+        self._inbound_first_seen: Dict[str, float] = {}
+        self._inbound_bytes: Dict[str, int] = {}
 
     # -- Properties --------------------------------------------------------
 
@@ -3697,6 +3699,10 @@ class ConnectionManager:
     # -- Inbound dispatch ---------------------------------------------------
 
     _DEBOUNCE_WINDOW: float = 1.5  # seconds to wait for companion messages
+    _DEBOUNCE_MAX_AGE: float = 5.0
+    _DEBOUNCE_MAX_FRAMES_PER_KEY: int = 32
+    _DEBOUNCE_MAX_BYTES_PER_KEY: int = 1024 * 1024
+    _DEBOUNCE_MAX_KEYS: int = 256
 
     def _extract_sender_key(self, raw_data: bytes) -> str:
         """Lightweight decode to extract sender key for debounce grouping.
@@ -3738,6 +3744,33 @@ class ConnectionManager:
         as separate WS pushes) into one pipeline run.
         """
         key = self._extract_sender_key(raw_data)
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+
+        # A sender cannot keep one buffer alive forever by continuously
+        # resetting the debounce timer. Flush at a fixed maximum age.
+        first_seen = self._inbound_first_seen.get(key)
+        if first_seen is not None and now - first_seen >= self._DEBOUNCE_MAX_AGE:
+            self._flush_inbound_buffer(key)
+            first_seen = None
+
+        # Bound the number of concurrently buffered sender keys. Flushing the
+        # oldest key preserves legitimate data while releasing its memory.
+        if key not in self._inbound_buffer and len(self._inbound_buffer) >= self._DEBOUNCE_MAX_KEYS:
+            oldest_key = min(
+                self._inbound_buffer,
+                key=lambda candidate: self._inbound_first_seen.get(candidate, now),
+            )
+            self._flush_inbound_buffer(oldest_key)
+
+        buffered = self._inbound_buffer.get(key, [])
+        buffered_bytes = self._inbound_bytes.get(key, 0)
+        if buffered and (
+            len(buffered) >= self._DEBOUNCE_MAX_FRAMES_PER_KEY
+            or buffered_bytes + len(raw_data) > self._DEBOUNCE_MAX_BYTES_PER_KEY
+        ):
+            self._flush_inbound_buffer(key)
+            first_seen = None
 
         # Cancel existing timer for this key (reset debounce window)
         existing_timer = self._inbound_timers.pop(key, None)
@@ -3747,17 +3780,24 @@ class ConnectionManager:
         # Append to buffer
         if key not in self._inbound_buffer:
             self._inbound_buffer[key] = []
+            self._inbound_first_seen[key] = now
+            self._inbound_bytes[key] = 0
         self._inbound_buffer[key].append(raw_data)
+        self._inbound_bytes[key] += len(raw_data)
 
         logger.debug(
             "[%s] Debounce: buffered frame for key=%s, count=%d",
             self._adapter.name, key, len(self._inbound_buffer[key]),
         )
 
-        # Schedule flush after debounce window
-        loop = asyncio.get_running_loop()
+        # Schedule no later than the fixed maximum age for this buffer.
+        first_seen = self._inbound_first_seen[key]
+        delay = max(
+            0.0,
+            min(self._DEBOUNCE_WINDOW, first_seen + self._DEBOUNCE_MAX_AGE - now),
+        )
         timer = loop.call_later(
-            self._DEBOUNCE_WINDOW,
+            delay,
             self._flush_inbound_buffer,
             key,
         )
@@ -3765,8 +3805,12 @@ class ConnectionManager:
 
     def _flush_inbound_buffer(self, key: str) -> None:
         """Flush the debounce buffer for a given key — execute the pipeline."""
-        self._inbound_timers.pop(key, None)
+        timer = self._inbound_timers.pop(key, None)
+        if timer:
+            timer.cancel()
         data_list = self._inbound_buffer.pop(key, [])
+        self._inbound_first_seen.pop(key, None)
+        self._inbound_bytes.pop(key, None)
         if not data_list:
             return
 

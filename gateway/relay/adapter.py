@@ -324,7 +324,7 @@ class RelayAdapter(BasePlatformAdapter):
         """
         await self.interrupt_session_activity(session_key, chat_id)
 
-    async def _on_passthrough(self, forward, buffer_id: Optional[str] = None) -> None:
+    async def _on_passthrough(self, forward, buffer_id: Optional[str] = None) -> bool:
         """Handle a connector-forwarded passthrough request (Phase 5 §5.1).
 
         The passthrough plane (Discord interactions, Twilio webhooks, …) answers
@@ -358,15 +358,17 @@ class RelayAdapter(BasePlatformAdapter):
                 if event is not None:
                     self._capture_scope(event)
                     await self.handle_message(event)
-                    return
+                    return True
             logger.info(
                 "relay passthrough_forward dropped (no handler): platform=%s method=%s path=%s",
                 platform,
                 getattr(forward, "method", "?"),
                 getattr(forward, "path", "?"),
             )
+            return True
         except Exception:  # noqa: BLE001 - a bad forward must never break the reader
             logger.warning("relay passthrough_forward handling failed", exc_info=True)
+            return False
 
     def _discord_interaction_to_event(self, forward):
         """Convert a forwarded Discord interaction body to a MessageEvent, or None.

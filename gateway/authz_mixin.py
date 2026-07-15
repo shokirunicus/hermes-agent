@@ -332,7 +332,9 @@ class GatewayAuthorizationMixin:
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                raw_chat_allowlist = self._profile_authz_env(
+                    source, chat_allowlist_env
+                ).strip()
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -356,7 +358,9 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and self._profile_authz_env(
+                source, allow_bots_var, "none"
+            ).lower().strip() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -425,7 +429,9 @@ class GatewayAuthorizationMixin:
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in {"true", "1", "yes"}:
+        if platform_allow_all_var and self._profile_authz_env(
+            source, platform_allow_all_var
+        ).lower() in {"true", "1", "yes"}:
             return True
 
         # Adapter-verified role auth: the Discord adapter already confirmed the
@@ -456,13 +462,21 @@ class GatewayAuthorizationMixin:
             return True
 
         # Check platform-specific and global allowlists
-        platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
+        platform_allowlist = self._profile_authz_env(
+            source, platform_env_map.get(source.platform, "")
+        ).strip()
         group_user_allowlist = ""
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
-            group_user_allowlist = os.getenv(platform_group_user_env_map.get(source.platform, ""), "").strip()
-            group_chat_allowlist = os.getenv(platform_group_chat_env_map.get(source.platform, ""), "").strip()
-        global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
+            group_user_allowlist = self._profile_authz_env(
+                source, platform_group_user_env_map.get(source.platform, "")
+            ).strip()
+            group_chat_allowlist = self._profile_authz_env(
+                source, platform_group_chat_env_map.get(source.platform, "")
+            ).strip()
+        global_allowlist = self._profile_authz_env(
+            source, "GATEWAY_ALLOWED_USERS"
+        ).strip()
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
             # No env allowlist configured. Adapters that own their own
@@ -511,7 +525,9 @@ class GatewayAuthorizationMixin:
                 if effective_policy == "allowlist":
                     return True
             # No allowlists configured -- check global allow-all flag
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+            return self._profile_authz_env(
+                source, "GATEWAY_ALLOW_ALL_USERS"
+            ).lower() in {"true", "1", "yes"}
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
@@ -595,12 +611,18 @@ class GatewayAuthorizationMixin:
         # regardless of which form was chosen.
         # Plugin platform: compare by value since Platform.SIMPLEX is not a
         # hardcoded enum member (it's a dynamic plugin platform).
+        simplex_display_ids = {
+            value.strip()
+            for value in platform_allowlist.split(",")
+            if value.strip()
+        }
         if (
             source.platform is not None
             and source.platform.value == "simplex"
             and source.user_name
+            and source.user_name in simplex_display_ids
         ):
-            check_ids.add(source.user_name)
+            return True
 
         return bool(check_ids & allowed_ids)
 
@@ -628,7 +650,15 @@ class GatewayAuthorizationMixin:
            and a potential info-leak. (#9337)
         6. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
         """
+        from gateway.run import logger
+
         config = getattr(self, "config", None)
+        authz_source = SessionSource(
+            platform=platform,
+            chat_id="",
+            chat_type="dm",
+            profile=profile,
+        )
 
         # Check for an explicit per-platform override first.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
@@ -698,13 +728,51 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+            if self._profile_authz_env(
+                authz_source, platform_env_map.get(platform, "")
+            ).strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if self._profile_authz_env(authz_source, env_key).strip():
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if self._profile_authz_env(
+            authz_source, "GATEWAY_ALLOWED_USERS"
+        ).strip():
             return "ignore"
 
         return "pair"
+
+    def _profile_authz_env(
+        self,
+        source: SessionSource,
+        name: str,
+        default: str = "",
+    ) -> str:
+        """Read an authorization setting from the source profile.
+
+        A multiplexed gateway cannot use the process environment for a
+        secondary profile: it contains the default profile's allowlists.
+        Profile ``.env`` files are deliberately read without mutating
+        ``os.environ`` so concurrent profile turns remain isolated.
+        """
+        from gateway.run import logger
+
+        if not name:
+            return default
+        config = getattr(self, "config", None)
+        profile = getattr(source, "profile", None)
+        if getattr(config, "multiplex_profiles", False) and profile:
+            try:
+                from agent.secret_scope import load_env_file
+
+                home = self._resolve_profile_home_for_source(source)
+                return load_env_file(home / ".env").get(name, default)
+            except Exception:
+                logger.warning(
+                    "Failed to read profile-scoped authorization setting %s; denying",
+                    name,
+                    exc_info=True,
+                )
+                return default
+        return os.getenv(name, default)

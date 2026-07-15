@@ -20,8 +20,8 @@ This module provides:
 
 ``button_data`` formats::
 
-    approve:<session_key>:<decision>      # decision = allow-once|allow-always|deny
-    update_prompt:<answer>                # answer = y|n
+    approve:<request_id>:<session_key>:<decision>
+    update_prompt:<prompt_id>:<answer>    # answer = y|n
 
 Ported from WideLee's qqbot-agent-sdk v1.2.2 (``approval.py`` + ``dto.py``
 keyboard types). Authorship preserved via Co-authored-by.
@@ -41,15 +41,15 @@ logger = logging.getLogger(__name__)
 APPROVAL_BUTTON_PREFIX = "approve:"
 UPDATE_PROMPT_PREFIX = "update_prompt:"
 
-# Pattern: approve:<session_key>:<decision>
+# Pattern: approve:<request_id>:<session_key>:<decision>
 # session_key may itself contain colons (e.g. agent:main:qqbot:c2c:OPENID),
 # so the session_key group is greedy but trails the decision.
 _APPROVAL_DATA_RE = re.compile(
-    r"^approve:(.+):(allow-once|allow-always|deny)$"
+    r"^approve:([A-Za-z0-9_-]{8,64}):(.+):(allow-once|allow-always|deny)$"
 )
 
-# Pattern: update_prompt:y | update_prompt:n
-_UPDATE_PROMPT_RE = re.compile(r"^update_prompt:(y|n)$")
+# Pattern: update_prompt:<prompt_id>:y | update_prompt:<prompt_id>:n
+_UPDATE_PROMPT_RE = re.compile(r"^update_prompt:([A-Za-z0-9_-]{8,64}):(y|n)$")
 
 
 # ── Keyboard dataclasses ─────────────────────────────────────────────
@@ -158,25 +158,27 @@ class InlineKeyboard:
 
 # ── INTERACTION_CREATE parsing ───────────────────────────────────────
 
-def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str]]:
-    """Parse approval ``button_data`` into ``(session_key, decision)``.
+def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str, str]]:
+    """Parse approval data into ``(request_id, session_key, decision)``.
 
     :param button_data: Raw ``data.resolved.button_data`` from
         ``INTERACTION_CREATE``.
-    :returns: ``(session_key, decision)`` or ``None`` if not an approval button.
+    :returns: The bound request, session, and decision; otherwise ``None``.
     """
     m = _APPROVAL_DATA_RE.match(button_data or "")
     if not m:
         return None
-    return m.group(1), m.group(2)
+    return m.group(1), m.group(2), m.group(3)
 
 
-def parse_update_prompt_button_data(button_data: str) -> Optional[str]:
-    """Parse update-prompt ``button_data`` into ``'y'`` or ``'n'``."""
+def parse_update_prompt_button_data(
+    button_data: str,
+) -> Optional[tuple[str, str]]:
+    """Parse update-prompt data into ``(prompt_id, answer)``."""
     m = _UPDATE_PROMPT_RE.match(button_data or "")
     if not m:
         return None
-    return m.group(1)
+    return m.group(1), m.group(2)
 
 
 # ── Keyboard builders ────────────────────────────────────────────────
@@ -201,15 +203,18 @@ def _make_callback_button(
     )
 
 
-def build_approval_keyboard(session_key: str) -> InlineKeyboard:
+def build_approval_keyboard(session_key: str, request_id: str) -> InlineKeyboard:
     """Build the 3-button approval keyboard.
 
     Layout: ``[✅ 允许一次] [⭐ 始终允许] [❌ 拒绝]`` — all three share
     ``group_id='approval'`` so clicking one greys out the rest.
 
-    :param session_key: Embedded into ``button_data`` so the decision
-        routes back to the right pending approval.
+    :param session_key: Routes the decision to the right session.
+    :param request_id: Binds the button to one live approval request.
     """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", request_id or ""):
+        raise ValueError("request_id must be an 8-64 character URL-safe token")
+    prefix = f"{APPROVAL_BUTTON_PREFIX}{request_id}:{session_key}:"
     return InlineKeyboard(
         content=KeyboardContent(
             rows=[
@@ -218,7 +223,7 @@ def build_approval_keyboard(session_key: str) -> InlineKeyboard:
                         btn_id="allow",
                         label="✅ 允许一次",
                         visited_label="已允许",
-                        data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-once",
+                        data=f"{prefix}allow-once",
                         style=1,
                         group_id="approval",
                     ),
@@ -226,7 +231,7 @@ def build_approval_keyboard(session_key: str) -> InlineKeyboard:
                         btn_id="always",
                         label="⭐ 始终允许",
                         visited_label="已始终允许",
-                        data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-always",
+                        data=f"{prefix}allow-always",
                         style=1,
                         group_id="approval",
                     ),
@@ -234,7 +239,7 @@ def build_approval_keyboard(session_key: str) -> InlineKeyboard:
                         btn_id="deny",
                         label="❌ 拒绝",
                         visited_label="已拒绝",
-                        data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:deny",
+                        data=f"{prefix}deny",
                         style=0,
                         group_id="approval",
                     ),
@@ -244,8 +249,10 @@ def build_approval_keyboard(session_key: str) -> InlineKeyboard:
     )
 
 
-def build_update_prompt_keyboard() -> InlineKeyboard:
+def build_update_prompt_keyboard(prompt_id: str) -> InlineKeyboard:
     """Build a Yes/No keyboard for update confirmation prompts."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", prompt_id or ""):
+        raise ValueError("prompt_id must be an 8-64 character URL-safe token")
     return InlineKeyboard(
         content=KeyboardContent(
             rows=[
@@ -254,7 +261,7 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
                         btn_id="yes",
                         label="✓ 确认",
                         visited_label="已确认",
-                        data=f"{UPDATE_PROMPT_PREFIX}y",
+                        data=f"{UPDATE_PROMPT_PREFIX}{prompt_id}:y",
                         style=1,
                         group_id="update_prompt",
                     ),
@@ -262,7 +269,7 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
                         btn_id="no",
                         label="✗ 取消",
                         visited_label="已取消",
-                        data=f"{UPDATE_PROMPT_PREFIX}n",
+                        data=f"{UPDATE_PROMPT_PREFIX}{prompt_id}:n",
                         style=0,
                         group_id="update_prompt",
                     ),
@@ -289,6 +296,7 @@ class ApprovalRequest:
     """
     session_key: str
     title: str
+    request_id: str = ""
     description: str = ""
     command_preview: str = ""
     cwd: str = ""
@@ -380,7 +388,10 @@ class ApprovalSender:
         :returns: ``True`` on success, ``False`` on failure.
         """
         text = build_approval_text(req)
-        keyboard = build_approval_keyboard(req.session_key)
+        if not req.request_id:
+            logger.warning("[%s] Approval request has no request_id", self._log_tag)
+            return False
+        keyboard = build_approval_keyboard(req.session_key, req.request_id)
 
         logger.info(
             "[%s] Sending approval request to %s:%s (session=%.20s…)",

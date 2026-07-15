@@ -1,15 +1,8 @@
-"""Verification-loop helpers for the ``pre_verify`` round-end gate.
+"""Verification and response-loop helpers for round-end policy gates.
 
-When the agent has edited code and is about to verify/finish, the loop fires the
-``pre_verify`` hook (user directives resolved by
-:func:`hermes_cli.plugins.get_pre_verify_continue_message`). A directive keeps
-the agent going one more turn — run a check, defer it, tidy the diff — instead of
-stopping immediately.
-
-The shipped coding guidance lives on the evidence-based verification-stop nudge
-(``agent/verification_stop.py``), not as a second default stop gate. That keeps
-the default token cost tied to the existing "missing verification evidence"
-decision while preserving ``pre_verify`` for user/plugin policy.
+``pre_verify`` lets user/plugin policy continue a coding turn after edits.
+``pre_response`` is the generic equivalent for reviewing any draft before it is
+returned. Both loops are bounded so a broken plugin cannot spin forever.
 """
 
 from __future__ import annotations
@@ -19,6 +12,17 @@ from typing import Any, Optional
 from utils import is_truthy_value
 
 DEFAULT_MAX_VERIFY_NUDGES = 3
+DEFAULT_MAX_RESPONSE_NUDGES = 2
+
+# Returned instead of the model's draft when required governance could not
+# evaluate it (enforcement dispatch crashed). Profiles that configure
+# ``plugins.required`` opt into fail-closed delivery: an unaudited draft is
+# never returned or persisted.
+GOVERNANCE_FAIL_CLOSED_RESPONSE = (
+    "この回答は認知統治の監査を実行できなかったため配信を止めました。"
+    "もう一度、依頼を言い換えて送ってください。"
+    "(governance fail-closed: an unaudited draft is never delivered)"
+)
 
 # Shipped guidance appended to the verification-stop nudge when code lacks fresh
 # verification evidence. Wording mirrors the user-facing "clean your work"
@@ -36,10 +40,24 @@ def max_verify_nudges(config: Optional[dict[str, Any]] = None) -> int:
     """Bound on consecutive ``pre_verify`` continue directives per turn (>= 0)."""
     agent_cfg = _agent_cfg(config)
     raw = agent_cfg.get("max_verify_nudges")
+    if raw is None:
+        return DEFAULT_MAX_VERIFY_NUDGES
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return DEFAULT_MAX_VERIFY_NUDGES
+
+
+def max_response_nudges(config: Optional[dict[str, Any]] = None) -> int:
+    """Bound on consecutive ``pre_response`` continuations per turn (>= 0)."""
+    agent_cfg = _agent_cfg(config)
+    raw = agent_cfg.get("max_response_nudges")
+    if raw is None:
+        return DEFAULT_MAX_RESPONSE_NUDGES
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RESPONSE_NUDGES
 
 
 def coding_verify_guidance(config: Optional[dict[str, Any]] = None) -> Optional[str]:
@@ -63,7 +81,10 @@ def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
 
 __all__ = [
     "CODING_VERIFY_GUIDANCE",
+    "DEFAULT_MAX_RESPONSE_NUDGES",
     "DEFAULT_MAX_VERIFY_NUDGES",
+    "GOVERNANCE_FAIL_CLOSED_RESPONSE",
     "coding_verify_guidance",
+    "max_response_nudges",
     "max_verify_nudges",
 ]

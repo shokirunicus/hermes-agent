@@ -154,6 +154,10 @@ VALID_HOOKS: Set[str] = {
     # verification-stop nudge; this hook is for user/plugin policy and is
     # bounded by agent.max_verify_nudges.
     "pre_verify",
+    # Generic round-end gate. A callback may reject a draft and keep the same
+    # turn running by returning {"action": "continue", "message": "..."}.
+    # The loop bounds retries via agent.max_response_nudges.
+    "pre_response",
     "pre_api_request",
     "post_api_request",
     "api_request_error",
@@ -234,6 +238,110 @@ def _get_disabled_plugins() -> set:
         config = load_config()
         disabled = cfg_get(config, "plugins", "disabled", default=[])
         return set(disabled) if isinstance(disabled, list) else set()
+    except Exception:
+        return set()
+
+
+class RequiredPluginError(RuntimeError):
+    """Raised when an agent profile cannot load a configured required plugin."""
+
+
+class GovernanceEnforcementError(RuntimeError):
+    """Raised when an enforcement hook crashed while governance is required.
+
+    Ordinary hook dispatch isolates plugin exceptions (observers must not
+    break the agent loop). Enforcement hooks are the opposite contract: when
+    a profile declares ``plugins.required``, a crashed enforcement callback
+    means policy could not be evaluated, and the caller must fail closed
+    (block the tool / withhold the draft) instead of silently allowing.
+    """
+
+
+# Hooks whose absence-of-answer must never be confused with approval.
+_ENFORCEMENT_HOOKS = frozenset({"pre_tool_call", "pre_response", "transform_llm_output"})
+
+
+def governance_config_unreadable() -> bool:
+    """True when the profile's config cannot be trusted to declare governance.
+
+    This is the keystone of fail-closed governance. ``load_config()``
+    swallows a YAML parse error and silently falls back to ``DEFAULT_CONFIG``
+    — which has no ``plugins`` key — so a corrupt config would otherwise make
+    ``_get_required_plugins()`` return empty and disable every fail-closed
+    branch at once (2026-07-14 review, P0). Two cases mean "we cannot know
+    what governance was required," and both fail closed (enforcement stays
+    active and startup aborts):
+
+      * the file is present but unparseable, or
+      * it parses, but ``plugins.required`` is present with a non-list type —
+        a malformed enforcement declaration that ``_get_required_plugins()``
+        would otherwise coerce silently to "nothing required" (re-review).
+
+    A genuinely absent config (fresh profile), or an absent/empty ``required``
+    key, declared nothing and is allowed to run.
+    """
+    try:
+        from hermes_cli.config import get_config_path
+
+        path = get_config_path()
+        if not path.exists():
+            return False
+        import yaml
+
+        with open(path, encoding="utf-8") as handle:
+            parsed = yaml.safe_load(handle)
+        if isinstance(parsed, dict):
+            plugins_cfg = parsed.get("plugins")
+            if isinstance(plugins_cfg, dict) and "required" in plugins_cfg:
+                if not isinstance(plugins_cfg["required"], list):
+                    # Enforcement was declared but in a shape we cannot read.
+                    return True
+        return False
+    except Exception:
+        # File is present and unreadable/unparseable — fail closed.
+        return True
+
+
+def required_enforcement_active() -> bool:
+    """True when governance must be enforced (fail-closed mode).
+
+    Either the profile declares required plugins, or its config could not be
+    parsed and we must assume governance was required.
+    """
+    return bool(_get_required_plugins()) or governance_config_unreadable()
+
+
+def enforcement_hook_missing(hook_name: str) -> bool:
+    """True when governance is required but *hook_name* is not registered.
+
+    ``required_enforcement_active()`` reads config, which can say True while
+    the plugin that should provide the hook silently failed to register (a
+    mid-session ``discover_plugins(force=True)`` that dropped it, or a config
+    unreadable enough that nothing loaded). An enforcement dispatch that finds
+    no registered hook must fail closed rather than treat "no result" as
+    approval (2026-07-14 review, P1).
+    """
+    if not required_enforcement_active():
+        return False
+    try:
+        return not has_hook(hook_name)
+    except Exception:
+        return True
+
+
+def _get_required_plugins() -> set[str]:
+    """Return profile plugins that must load before an agent may start.
+
+    Management commands intentionally do not call the validator, so a broken
+    required plugin can still be repaired or disabled. Agent runtime entry
+    points call :func:`validate_required_plugins` after discovery.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        required = cfg_get(config, "plugins", "required", default=[])
+        return set(required) if isinstance(required, list) else set()
     except Exception:
         return set()
 
@@ -1910,18 +2018,31 @@ class PluginManager:
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
+        dispatch_errors: List[str] = []
         for cb in callbacks:
             try:
                 ret = cb(**kwargs)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                dispatch_errors.append(
+                    f"{getattr(cb, '__name__', repr(cb))}: {exc}"
+                )
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+        if (
+            dispatch_errors
+            and hook_name in _ENFORCEMENT_HOOKS
+            and required_enforcement_active()
+        ):
+            raise GovernanceEnforcementError(
+                f"enforcement hook '{hook_name}' could not be evaluated: "
+                + "; ".join(dispatch_errors)
+            )
         return results
 
     def has_hook(self, hook_name: str) -> bool:
@@ -2044,6 +2165,54 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
+def validate_required_plugins(manager: Optional[PluginManager] = None) -> None:
+    """Fail agent startup when a profile-required plugin is unavailable."""
+    if governance_config_unreadable():
+        # We cannot even read whether governance is required. Running now
+        # would silently fall back to DEFAULT_CONFIG (no plugins) and start
+        # ungoverned — the exact P0 fail-open. Refuse instead.
+        raise RequiredPluginError(
+            "config.yaml could not be read as a governance declaration (invalid "
+            "YAML, or plugins.required is not a list), so required-plugin "
+            "governance cannot be verified. The agent will not start ungoverned. "
+            "Fix this profile's config.yaml (valid YAML; plugins.required must be "
+            "a list), then retry."
+        )
+
+    required = _get_required_plugins()
+    if not required:
+        return
+
+    manager = manager or get_plugin_manager()
+    loaded_by_name: Dict[str, LoadedPlugin] = {}
+    for key, loaded in manager._plugins.items():
+        loaded_by_name[key] = loaded
+        loaded_by_name[loaded.manifest.name] = loaded
+        if loaded.manifest.key:
+            loaded_by_name[loaded.manifest.key] = loaded
+
+    failures: List[str] = []
+    for plugin_name in sorted(required):
+        loaded = loaded_by_name.get(plugin_name)
+        if loaded is None:
+            failures.append(f"{plugin_name}: missing")
+            continue
+        if not loaded.enabled or loaded.error:
+            failures.append(
+                f"{plugin_name}: {loaded.error or 'disabled or not registered'}"
+            )
+
+    if failures:
+        raise RequiredPluginError(
+            "Required plugin enforcement failed: "
+            + "; ".join(failures)
+            + ". Repair with `hermes plugins`, or remove the plugin from "
+            "`plugins.required` in config.yaml to opt out of enforcement. "
+            "Safe mode does not bypass this check: a profile that requires "
+            "governance refuses to run ungoverned."
+        )
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook on all loaded plugins.
 
@@ -2140,17 +2309,38 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
-    hook_results = invoke_hook(
-        "pre_tool_call",
-        tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
-        task_id=task_id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-        middleware_trace=list(middleware_trace or []),
-    )
+    if enforcement_hook_missing("pre_tool_call"):
+        return _PreToolCallDirective(
+            action="block",
+            message=(
+                f"Tool '{tool_name}' blocked: governance is required for this "
+                "profile but its pre_tool_call enforcement hook is not registered. "
+                "Repair the governance plugin before running consequential actions."
+            ),
+        )
+
+    try:
+        hook_results = invoke_hook(
+            "pre_tool_call",
+            tool_name=tool_name,
+            args=args if isinstance(args, dict) else {},
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            middleware_trace=list(middleware_trace or []),
+        )
+    except GovernanceEnforcementError as exc:
+        # Required governance could not evaluate this call — fail closed.
+        return _PreToolCallDirective(
+            action="block",
+            message=(
+                f"Tool '{tool_name}' blocked: required governance enforcement "
+                f"was unavailable ({exc}). Repair the governance plugin before "
+                "retrying consequential actions."
+            ),
+        )
 
     for result in hook_results:
         if not isinstance(result, dict):
@@ -2310,6 +2500,47 @@ def get_pre_verify_continue_message(
         attempt=attempt,
         final_response=final_response,
         changed_paths=list(changed_paths or []),
+    )
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = str(result.get("action") or result.get("decision") or "").strip().lower()
+        if action not in ("continue", "block"):
+            continue
+        message = result.get("message") or result.get("reason")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    return None
+
+
+def get_pre_response_continue_message(
+    *,
+    session_id: str = "",
+    turn_id: str = "",
+    platform: str = "",
+    model: str = "",
+    attempt: int = 0,
+    user_message: str = "",
+    final_response: str = "",
+) -> Optional[str]:
+    """Check ``pre_response`` hooks before returning a draft to the user.
+
+    A hook can keep the same turn running by returning
+    ``{"action": "continue", "message": "<follow-up>"}``. The Claude-Code
+    stop shape (``decision=block``) is accepted for hook compatibility. The
+    caller owns retry bounds and role-alternation-safe synthetic messages.
+    """
+    hook_results = invoke_hook(
+        "pre_response",
+        session_id=session_id,
+        turn_id=turn_id,
+        platform=platform,
+        model=model,
+        attempt=attempt,
+        user_message=user_message,
+        final_response=final_response,
     )
 
     for result in hook_results:

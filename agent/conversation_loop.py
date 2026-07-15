@@ -627,6 +627,40 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # The codex app-server runtime executes tools and returns finals
+        # without passing pre_tool_call / pre_response / transform gates.
+        # A profile that requires governance refuses this ungovernable
+        # path outright instead of running around its own enforcement
+        # (2026-07-14 review, P0).
+        _codex_governance_required = False
+        try:
+            from hermes_cli.plugins import required_enforcement_active
+
+            _codex_governance_required = required_enforcement_active()
+        except Exception:
+            logger.debug(
+                "required-governance check failed for codex runtime", exc_info=True
+            )
+        if _codex_governance_required:
+            _codex_refusal = (
+                "codex_app_server runtime is disabled on this profile: it "
+                "bypasses required governance hooks. Use the default runtime "
+                "(`/codex-runtime auto`) or remove the plugin from "
+                "`plugins.required` to opt out of enforcement."
+            )
+            try:
+                messages.append({"role": "assistant", "content": _codex_refusal})
+                agent._persist_session(messages, conversation_history)
+            except Exception:
+                logger.debug("codex refusal persist failed", exc_info=True)
+            return {
+                "final_response": _codex_refusal,
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": "codex_app_server refused under required governance",
+            }
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -1308,6 +1342,37 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                # Response-governance quarantine. A gate that can *reject* a
+                # draft must see it before any callback does — streaming would
+                # speak or print the rejected text and no later transform can
+                # retract it. So a governed turn takes the complete-response
+                # path (2026-07-14 review, P0).
+                #
+                # Scoped deliberately: `pre_response` always rejects-or-
+                # continues, so its presence alone disables streaming. A bare
+                # `transform_llm_output` is usually cosmetic (a style or
+                # redaction pass) and keeps streaming — unless the profile
+                # declares required enforcement, where the transform is a
+                # withholding gate too.
+                if _use_streaming:
+                    try:
+                        from hermes_cli.plugins import (
+                            has_hook as _gate_has_hook,
+                            required_enforcement_active,
+                        )
+
+                        if _gate_has_hook("pre_response") or (
+                            _gate_has_hook("transform_llm_output")
+                            and required_enforcement_active()
+                        ):
+                            _use_streaming = False
+                    except Exception:
+                        logger.warning(
+                            "response-gate check failed; disabling streaming defensively",
+                            exc_info=True,
+                        )
+                        _use_streaming = False
+
                 def _perform_api_call(next_api_kwargs):
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -1934,6 +1999,16 @@ def run_conversation(
                                 break
 
                             partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
+                            # Model text delivered outside finalize_turn must
+                            # still pass the governance transform gate.
+                            from agent.turn_finalizer import enforce_direct_final
+
+                            partial_response = enforce_direct_final(
+                                agent,
+                                partial_response,
+                                turn_id=turn_id,
+                                user_message=original_user_message or "",
+                            )
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
@@ -5222,6 +5297,91 @@ def run_conversation(
                     logger.debug("pre_verify nudge issued (attempt %d)",
                                  agent._pre_verify_nudges)
                     continue
+
+                # Generic response-governance gate. Unlike
+                # ``transform_llm_output``, this hook can reject a draft and ask
+                # the model to regenerate before anything is returned. The
+                # synthetic assistant/user pair preserves role alternation and
+                # is excluded from durable session state.
+                from agent.verify_hooks import max_response_nudges
+
+                _response_nudge = None
+                _response_attempt = getattr(agent, "_pre_response_nudges", 0)
+                _response_gate_failed = False
+                try:
+                    from hermes_cli.plugins import (
+                        enforcement_hook_missing,
+                        get_pre_response_continue_message,
+                        has_hook,
+                    )
+
+                    # Required governance whose pre_response hook is absent
+                    # must not treat "no hook" as approval (2026-07-14, P1).
+                    if enforcement_hook_missing("pre_response"):
+                        _response_gate_failed = True
+                    # Evaluate EVERY candidate — the nudge cap below only
+                    # bounds how many regenerations are honored. Skipping
+                    # evaluation of the final candidate would ship a draft
+                    # no gate ever examined (2026-07-14 review, P1).
+                    elif has_hook("pre_response"):
+                        _response_nudge = get_pre_response_continue_message(
+                            session_id=getattr(agent, "session_id", None) or "",
+                            turn_id=turn_id,
+                            platform=getattr(agent, "platform", None) or "",
+                            model=getattr(agent, "model", None) or "",
+                            attempt=_response_attempt,
+                            user_message=original_user_message,
+                            final_response=final_response,
+                        )
+                except Exception:
+                    _response_nudge = None
+                    try:
+                        from hermes_cli.plugins import required_enforcement_active
+
+                        _response_gate_failed = required_enforcement_active()
+                    except Exception:
+                        _response_gate_failed = False
+                    logger.log(
+                        logging.ERROR if _response_gate_failed else logging.WARNING,
+                        "pre_response hook check failed; %s",
+                        "failing closed (required governance)"
+                        if _response_gate_failed
+                        else "continuing without a nudge",
+                        exc_info=True,
+                    )
+
+                if _response_gate_failed:
+                    # Required governance could not examine this draft. An
+                    # unaudited draft is never delivered or persisted.
+                    from agent.verify_hooks import GOVERNANCE_FAIL_CLOSED_RESPONSE
+
+                    final_response = GOVERNANCE_FAIL_CLOSED_RESPONSE
+                    final_msg["content"] = final_response
+
+                if _response_nudge and _response_attempt < max_response_nudges():
+                    agent._pre_response_nudges = _response_attempt + 1
+                    final_msg["finish_reason"] = "response_governance_continue"
+                    final_msg["_pre_response_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _response_nudge,
+                        "_pre_response_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug(
+                        "pre_response nudge issued (attempt %d)",
+                        agent._pre_response_nudges,
+                    )
+                    continue
+
+                if _response_attempt:
+                    messages = [
+                        message
+                        for message in messages
+                        if not message.get("_pre_response_synthetic")
+                    ]
+                    agent._session_messages = messages
 
                 messages.append(final_msg)
                 

@@ -453,6 +453,8 @@ class GatewaySlashCommandsMixin:
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
+                                    chat_type=str(getattr(source, "chat_type", "") or "") or None,
+                                    external_origin=True,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                 )
                             finally:
@@ -1695,7 +1697,11 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
 
-                    metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    metadata = self._thread_metadata_for_source(
+                        source, self._reply_anchor_for_event(event)
+                    )
+                    metadata = dict(metadata or {})
+                    metadata["user_id"] = source.user_id
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,

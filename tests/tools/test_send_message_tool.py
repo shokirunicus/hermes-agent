@@ -507,6 +507,7 @@ class TestSendMessageTool:
             get_session_env_mock.side_effect = lambda name, default="": {
                 "HERMES_SESSION_PLATFORM": "telegram",
                 "HERMES_SESSION_USER_ID": "user-123",
+                "HERMES_SESSION_PROFILE": "coder",
             }.get(name, default)
             result = json.loads(
                 send_message_tool(
@@ -526,6 +527,7 @@ class TestSendMessageTool:
             source_label="telegram",
             thread_id=None,
             user_id="user-123",
+            profile="coder",
         )
 
     def test_media_tag_outside_allowed_roots_is_not_sent(self, tmp_path, monkeypatch):

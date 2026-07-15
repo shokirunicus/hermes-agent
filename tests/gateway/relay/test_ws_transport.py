@@ -17,7 +17,11 @@ import json
 import pytest
 import pytest_asyncio
 
-from gateway.relay.ws_transport import WebSocketRelayTransport, WEBSOCKETS_AVAILABLE
+from gateway.relay.ws_transport import (
+    WEBSOCKETS_AVAILABLE,
+    WebSocketRelayTransport,
+    _ws_dial_url,
+)
 
 pytestmark = pytest.mark.skipif(not WEBSOCKETS_AVAILABLE, reason="websockets not installed")
 
@@ -36,6 +40,22 @@ DESCRIPTOR = {
     "markdown_dialect": "discord",
     "len_unit": "chars",
 }
+
+
+@pytest.mark.parametrize("scheme", ["WS", "Ws", "wS"])
+def test_mixed_case_remote_plaintext_relay_is_rejected(scheme):
+    with pytest.raises(ValueError, match="must use https:// or wss://"):
+        _ws_dial_url(f"{scheme}://relay.example.test")
+
+
+def test_mixed_case_secure_and_loopback_relay_urls_remain_supported():
+    assert _ws_dial_url("WSS://relay.example.test") == "wss://relay.example.test/relay"
+    assert _ws_dial_url("WS://127.0.0.1:3138") == "ws://127.0.0.1:3138/relay"
+
+
+def test_unknown_relay_scheme_is_rejected():
+    with pytest.raises(ValueError, match="scheme must be"):
+        _ws_dial_url("ftp://relay.example.test")
 
 
 class _StubConnectorServer:
@@ -187,8 +207,8 @@ def test_https_url_normalized_to_wss():
     'server rejected WebSocket connection: HTTP 400' (wrong path)."""
     t = WebSocketRelayTransport("https://connector.example", "discord", "b")
     assert t._url == "wss://connector.example/relay"
-    t2 = WebSocketRelayTransport("http://connector.local:8080", "discord", "b")
-    assert t2._url == "ws://connector.local:8080/relay"
+    with pytest.raises(ValueError, match="non-loopback relay endpoints"):
+        WebSocketRelayTransport("http://connector.local:8080", "discord", "b")
 
 
 def test_ws_dial_url_idempotent_with_scheme_and_path():

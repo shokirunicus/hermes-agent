@@ -4806,6 +4806,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "current_model": current_model,
                 "current_provider": current_provider,
                 "provider_page": 0,
+                "requester_user_id": str(
+                    (metadata or {}).get("user_id") or ""
+                ),
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -4935,6 +4938,24 @@ class TelegramAdapter(BasePlatformAdapter):
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
+            return
+
+        requester_user_id = str(state.get("requester_user_id") or "")
+        callback_user_id = str(
+            getattr(getattr(query, "from_user", None), "id", "") or ""
+        )
+        query_message = getattr(query, "message", None)
+        query_chat = getattr(query_message, "chat", None)
+        query_chat_type = str(getattr(query_chat, "type", "") or "")
+        auth_chat_type = "dm" if query_chat_type == "private" else "group"
+        if (
+            not requester_user_id
+            or callback_user_id != requester_user_id
+            or self._is_sender_authorized(
+                callback_user_id, auth_chat_type, chat_id
+            ) is not True
+        ):
+            await query.answer(text="This picker belongs to another user.")
             return
 
         try:

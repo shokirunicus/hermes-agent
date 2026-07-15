@@ -71,3 +71,25 @@ class TestWebhookProfileResolution:
             lambda multiplex: [(n, None) for n in served],
         )
         assert adapter._resolve_request_profile(Req("ghost")) is REJ
+
+    @pytest.mark.parametrize("profiles", [None, [], "coder", {"coder": True}])
+    def test_route_requires_explicit_profile_grant(self, profiles):
+        from gateway.platforms.webhook import WebhookAdapter
+
+        route = {} if profiles is None else {"profiles": profiles}
+        assert WebhookAdapter._route_allows_profile(route, "coder") is False
+
+    def test_route_accepts_named_or_wildcard_profile_grant(self):
+        from gateway.platforms.webhook import WebhookAdapter
+
+        assert WebhookAdapter._route_allows_profile(
+            {"profiles": ["coder"]}, "coder"
+        )
+        assert WebhookAdapter._route_allows_profile(
+            {"profiles": ["*"]}, "coder"
+        )
+
+    def test_unprefixed_route_does_not_require_profile_grant(self):
+        from gateway.platforms.webhook import WebhookAdapter
+
+        assert WebhookAdapter._route_allows_profile({}, None)

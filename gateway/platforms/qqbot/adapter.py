@@ -37,6 +37,8 @@ import json
 import logging
 import mimetypes
 import os
+import re
+import secrets
 import time
 import uuid
 from datetime import datetime, timezone
@@ -260,6 +262,8 @@ class QQAdapter(BasePlatformAdapter):
         # box; callers can override with set_interaction_callback(None) or
         # register a custom handler.
         self._interaction_callback = self._default_interaction_dispatch
+        self._pending_update_prompt_session_key: Optional[str] = None
+        self._pending_update_prompt_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -1068,9 +1072,10 @@ class QQAdapter(BasePlatformAdapter):
     def _parse_gateway_session_key(session_key: str) -> Optional[Dict[str, str]]:
         """Parse ``agent:main:<platform>:<chat_type>:<chat_id>[:<user_id>]``."""
         parts = str(session_key or "").split(":")
-        if len(parts) < 5 or parts[0] != "agent" or parts[1] != "main":
+        if len(parts) < 5 or parts[0] != "agent" or not parts[1]:
             return None
         parsed = {
+            "profile": parts[1],
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
@@ -1104,13 +1109,32 @@ class QQAdapter(BasePlatformAdapter):
 
         return False
 
+    def _is_currently_authorized_interaction_for_session(
+        self,
+        event: InteractionEvent,
+        session_key: str,
+    ) -> bool:
+        """Re-check current policy after binding a button to its owner/chat."""
+        if not self._is_authorized_interaction_for_session(event, session_key):
+            return False
+        parsed = self._parse_gateway_session_key(session_key)
+        if not parsed:
+            return False
+        operator = str(event.operator_openid or "").strip()
+        decision = self._is_sender_authorized(
+            operator,
+            parsed.get("chat_type"),
+            parsed.get("chat_id"),
+        )
+        return decision is True
+
     async def _default_interaction_dispatch(
             self,
             event: InteractionEvent,
     ) -> None:
         """Route ``INTERACTION_CREATE`` button clicks to the right subsystem.
 
-        - ``approve:<session_key>:<decision>`` →
+        - ``approve:<request_id>:<session_key>:<decision>`` →
           :func:`tools.approval.resolve_gateway_approval`
           (unblocks the agent thread waiting on a dangerous-command approval).
         - ``update_prompt:<answer>`` →
@@ -1129,7 +1153,7 @@ class QQAdapter(BasePlatformAdapter):
 
         approval = parse_approval_button_data(button_data)
         if approval is not None:
-            session_key, decision = approval
+            request_id, session_key, decision = approval
             choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
             if choice is None:
                 logger.warning(
@@ -1137,7 +1161,9 @@ class QQAdapter(BasePlatformAdapter):
                     self._log_tag, decision, session_key,
                 )
                 return
-            if not self._is_authorized_interaction_for_session(event, session_key):
+            if not self._is_currently_authorized_interaction_for_session(
+                event, session_key
+            ):
                 logger.warning(
                     "[%s] Rejected unauthorized approval click for session %s "
                     "(operator=%s)",
@@ -1148,7 +1174,11 @@ class QQAdapter(BasePlatformAdapter):
                 # Import lazily to keep the adapter importable in tests that
                 # don't exercise the approval subsystem.
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    request_id=request_id,
+                )
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s "
                     "(choice=%s, operator=%s)",
@@ -1162,16 +1192,28 @@ class QQAdapter(BasePlatformAdapter):
                 )
             return
 
-        update_answer = parse_update_prompt_button_data(button_data)
-        if update_answer is not None:
-            update_session_key = f"agent:main:qqbot:{event.scene}:{event.group_openid or event.guild_id or event.user_openid}"
-            if not self._is_authorized_interaction_for_session(event, update_session_key):
+        update_prompt = parse_update_prompt_button_data(button_data)
+        if update_prompt is not None:
+            prompt_id, update_answer = update_prompt
+            update_session_key = self._pending_update_prompt_session_key
+            if (
+                not update_session_key
+                or not self._pending_update_prompt_id
+                or not secrets.compare_digest(
+                    prompt_id, self._pending_update_prompt_id
+                )
+                or not self._is_currently_authorized_interaction_for_session(
+                    event, update_session_key
+                )
+            ):
                 logger.warning(
                     "[%s] Rejected unauthorized update prompt click (operator=%s)",
                     self._log_tag, event.operator_openid,
                 )
                 return
             self._write_update_response(update_answer, event.operator_openid)
+            self._pending_update_prompt_session_key = None
+            self._pending_update_prompt_id = None
             return
 
         logger.debug(
@@ -1243,6 +1285,13 @@ class QQAdapter(BasePlatformAdapter):
                     )
 
         # Process all attachments uniformly (images, voice, files)
+        sender_authorized = self._is_sender_authorized(
+            user_openid, "c2c", user_openid
+        )
+        if sender_authorized is False:
+            attachments_raw = []
+            if not text and d.get("attachments"):
+                text = "(attachment omitted until sender is authorized)"
         att_result = await self._process_attachments(attachments_raw)
         image_urls = att_result["image_urls"]
         image_media_types = att_result["image_media_types"]
@@ -1271,7 +1320,15 @@ class QQAdapter(BasePlatformAdapter):
         )
 
         # Merge any quoted-message context (message_type=103 → msg_elements[0]).
-        quoted = await self._process_quoted_context(d)
+        quoted = (
+            await self._process_quoted_context(d)
+            if sender_authorized is not False
+            else {
+                "quote_block": "",
+                "image_urls": [],
+                "image_media_types": [],
+            }
+        )
         text = self._merge_quote_into(text, quoted["quote_block"])
         if quoted["image_urls"]:
             image_urls = image_urls + quoted["image_urls"]
@@ -1316,7 +1373,16 @@ class QQAdapter(BasePlatformAdapter):
 
         # Strip the @bot mention prefix from content
         text = self._strip_at_mention(content)
-        att_result = await self._process_attachments(d.get("attachments"))
+        member_openid = str(author.get("member_openid", ""))
+        sender_authorized = self._is_sender_authorized(
+            member_openid, "group", group_openid
+        )
+        attachments = d.get("attachments")
+        if sender_authorized is False:
+            attachments = []
+            if not text and d.get("attachments"):
+                text = "(attachment omitted until sender is authorized)"
+        att_result = await self._process_attachments(attachments)
         image_urls = att_result["image_urls"]
         image_media_types = att_result["image_media_types"]
         voice_transcripts = att_result["voice_transcripts"]
@@ -1336,7 +1402,15 @@ class QQAdapter(BasePlatformAdapter):
             )
 
         # Merge any quoted-message context (message_type=103 → msg_elements[0]).
-        quoted = await self._process_quoted_context(d)
+        quoted = (
+            await self._process_quoted_context(d)
+            if sender_authorized is not False
+            else {
+                "quote_block": "",
+                "image_urls": [],
+                "image_media_types": [],
+            }
+        )
         text = self._merge_quote_into(text, quoted["quote_block"])
         if quoted["image_urls"]:
             image_urls = image_urls + quoted["image_urls"]
@@ -1391,7 +1465,15 @@ class QQAdapter(BasePlatformAdapter):
         nick = str(member.get("nick", "")) or str(author.get("username", ""))
 
         text = content
-        att_result = await self._process_attachments(d.get("attachments"))
+        sender_authorized = self._is_sender_authorized(
+            author_id, "group", guild_id or channel_id
+        )
+        attachments = d.get("attachments")
+        if sender_authorized is False:
+            attachments = []
+            if not text and d.get("attachments"):
+                text = "(attachment omitted until sender is authorized)"
+        att_result = await self._process_attachments(attachments)
         image_urls = att_result["image_urls"]
         image_media_types = att_result["image_media_types"]
         voice_transcripts = att_result["voice_transcripts"]
@@ -1410,7 +1492,15 @@ class QQAdapter(BasePlatformAdapter):
             )
 
         # Merge any quoted-message context (message_type=103 → msg_elements[0]).
-        quoted = await self._process_quoted_context(d)
+        quoted = (
+            await self._process_quoted_context(d)
+            if sender_authorized is not False
+            else {
+                "quote_block": "",
+                "image_urls": [],
+                "image_media_types": [],
+            }
+        )
         text = self._merge_quote_into(text, quoted["quote_block"])
         if quoted["image_urls"]:
             image_urls = image_urls + quoted["image_urls"]
@@ -1462,7 +1552,15 @@ class QQAdapter(BasePlatformAdapter):
             return
 
         text = content
-        att_result = await self._process_attachments(d.get("attachments"))
+        sender_authorized = self._is_sender_authorized(
+            author_id, "dm", guild_id
+        )
+        attachments = d.get("attachments")
+        if sender_authorized is False:
+            attachments = []
+            if not text and d.get("attachments"):
+                text = "(attachment omitted until sender is authorized)"
+        att_result = await self._process_attachments(attachments)
         image_urls = att_result["image_urls"]
         image_media_types = att_result["image_media_types"]
         voice_transcripts = att_result["voice_transcripts"]
@@ -1481,7 +1579,15 @@ class QQAdapter(BasePlatformAdapter):
             )
 
         # Merge any quoted-message context (message_type=103 → msg_elements[0]).
-        quoted = await self._process_quoted_context(d)
+        quoted = (
+            await self._process_quoted_context(d)
+            if sender_authorized is not False
+            else {
+                "quote_block": "",
+                "image_urls": [],
+                "image_media_types": [],
+            }
+        )
         text = self._merge_quote_into(text, quoted["quote_block"])
         if quoted["image_urls"]:
             image_urls = image_urls + quoted["image_urls"]
@@ -2640,7 +2746,7 @@ class QQAdapter(BasePlatformAdapter):
         return await self.send_with_keyboard(
             chat_id,
             build_approval_text(req),
-            build_approval_keyboard(req.session_key),
+            build_approval_keyboard(req.session_key, req.request_id),
             reply_to=reply_to,
         )
 
@@ -2668,7 +2774,13 @@ class QQAdapter(BasePlatformAdapter):
         :func:`tools.approval.resolve_gateway_approval` — dispatched by the
         adapter's interaction callback (:meth:`_default_interaction_dispatch`).
         """
-        del metadata  # QQ doesn't have thread_id / DM targeting overrides.
+        metadata = dict(metadata or {})
+        request_id = str(metadata.get("approval_request_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", request_id):
+            return SendResult(
+                success=False,
+                error="QQ approval requires a bound request ID",
+            )
 
         # Use the reply-to message for passive-message context when we have one.
         # QQ requires a msg_id on outbound messages to a user we've never
@@ -2678,6 +2790,7 @@ class QQAdapter(BasePlatformAdapter):
         req = ApprovalRequest(
             session_key=session_key,
             title="Execute this command?",
+            request_id=request_id,
             description=description,
             command_preview=command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
@@ -2706,17 +2819,29 @@ class QQAdapter(BasePlatformAdapter):
         ``~/.hermes/.update_response`` so the detached update process
         can read it.
         """
-        del session_key, metadata  # present for contract parity only.
+        del metadata  # present for contract parity only.
+
+        if not session_key:
+            return SendResult(
+                success=False,
+                error="QQ update prompt requires a bound session",
+                retryable=False,
+            )
+        prompt_id = secrets.token_urlsafe(12)
 
         default_hint = f" (default: {default})" if default else ""
         content = f"⚕ **Update Needs Your Input**\n\n{prompt}{default_hint}"
         msg_id = self._last_msg_id.get(chat_id)
-        return await self.send_with_keyboard(
+        result = await self.send_with_keyboard(
             chat_id,
             content,
-            build_update_prompt_keyboard(),
+            build_update_prompt_keyboard(prompt_id),
             reply_to=msg_id,
         )
+        if result.success:
+            self._pending_update_prompt_session_key = session_key
+            self._pending_update_prompt_id = prompt_id
+        return result
 
     def _build_text_body(
             self, content: str, reply_to: Optional[str] = None

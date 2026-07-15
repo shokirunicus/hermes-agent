@@ -115,6 +115,27 @@ class TestFindSessionId:
 
         assert result is None
 
+    def test_cross_profile_match_requires_explicit_profile(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "agent:main:telegram:dm:12345": {
+                "session_id": "sess_main",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-01-01T00:00:00",
+            },
+            "agent:coder:telegram:dm:12345": {
+                "session_id": "sess_coder",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-02-01T00:00:00",
+            },
+        })
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            assert _find_session_id("telegram", "12345") is None
+            assert _find_session_id(
+                "telegram", "12345", profile="coder"
+            ) == "sess_coder"
+
     def test_no_match_returns_none(self, tmp_path):
         sessions_dir, index_file = _setup_sessions(tmp_path, {
             "sess": {

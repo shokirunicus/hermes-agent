@@ -21,12 +21,15 @@ Public API (signatures preserved from the original 2,400-line version):
 """
 
 import os
+import contextvars
 import json
 import re
 import asyncio
 import logging
 import threading
 import time
+from contextlib import contextmanager
+from functools import wraps
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
@@ -202,10 +205,67 @@ discover_builtin_tools()
 
 # Plugin tool discovery (user/project/pip plugins)
 try:
-    from hermes_cli.plugins import discover_plugins
+    from hermes_cli.plugins import (
+        RequiredPluginError,
+        discover_plugins,
+        validate_required_plugins,
+    )
+
     discover_plugins()
+    validate_required_plugins()
+except RequiredPluginError:
+    raise
 except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
+
+
+# =============================================================================
+# Dispatch identity  (nested tool calls inherit session/turn for policy hooks)
+# =============================================================================
+
+# Sandbox proxies (execute_code) and other indirect callers re-enter
+# handle_function_call with only task_id, which used to fire pre_tool_call
+# hooks with empty session/turn defaults — an authorization bypass for any
+# per-turn policy (2026-07-14 review, P0). The ambient identity is carried in
+# a ContextVar; thread-based proxies must propagate it explicitly with
+# ``contextvars.copy_context()`` at spawn time.
+_DISPATCH_IDENTITY: contextvars.ContextVar[Tuple[str, str]] = contextvars.ContextVar(
+    "hermes_dispatch_identity", default=("", "")
+)
+
+
+@contextmanager
+def dispatch_context(session_id: str = "", turn_id: str = ""):
+    """Bind the governed session/turn identity for nested tool dispatch."""
+    token = _DISPATCH_IDENTITY.set((str(session_id or ""), str(turn_id or "")))
+    try:
+        yield
+    finally:
+        _DISPATCH_IDENTITY.reset(token)
+
+
+def _scoped_dispatch_identity(func):
+    """Keep explicit dispatch identity scoped to one outer tool call.
+
+    Nested synchronous dispatch inherits the active identity, but the binding
+    is reset before the caller's next unrelated tool call. Positional support
+    preserves the public ``handle_function_call`` signature.
+    """
+
+    @wraps(func)
+    def _wrapped(*args, **kwargs):
+        explicit_session = kwargs.get(
+            "session_id", args[4] if len(args) > 4 else None
+        )
+        explicit_turn = kwargs.get("turn_id", args[5] if len(args) > 5 else None)
+        ambient_session, ambient_turn = _DISPATCH_IDENTITY.get()
+        with dispatch_context(
+            session_id=explicit_session or ambient_session,
+            turn_id=explicit_turn or ambient_turn,
+        ):
+            return func(*args, **kwargs)
+
+    return _wrapped
 
 
 # =============================================================================
@@ -1016,6 +1076,7 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+@_scoped_dispatch_identity
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1062,6 +1123,12 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # Inherit or seed the ambient dispatch identity so nested dispatch
+    # (sandbox proxies calling back with only task_id) keeps firing policy
+    # hooks under the real session/turn instead of empty defaults.
+    _ambient_session, _ambient_turn = _DISPATCH_IDENTITY.get()
+    session_id = session_id or _ambient_session or None
+    turn_id = turn_id or _ambient_turn or None
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
@@ -1188,6 +1255,20 @@ def handle_function_call(
                 )
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
+                try:
+                    from hermes_cli.plugins import required_enforcement_active
+
+                    if required_enforcement_active():
+                        # Required governance could not evaluate this call —
+                        # a dispatch failure is a block, not an allow.
+                        block_message = (
+                            f"Tool '{function_name}' blocked: required "
+                            "governance enforcement was unavailable "
+                            f"({_hook_err}). Repair the governance plugin "
+                            "before retrying consequential actions."
+                        )
+                except Exception:
+                    pass
 
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)

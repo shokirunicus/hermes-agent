@@ -1003,6 +1003,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         from gateway.session_context import get_session_env
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        session_key = (
+            get_session_env("HERMES_SESSION_KEY", "")
+            or os.environ.get("HERMES_SESSION_KEY", "")
+        )
         if not platform or not chat_id:
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
@@ -1017,14 +1021,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             # every CLI invocation, which is exactly the over-eager
             # behaviour that got #19718 reverted upstream. The TUI
             # poller keys on HERMES_SESSION_KEY.
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
-            )
             if not session_key:
                 return False  # CLI / cron / test — no persistent channel
             platform = "tui"
             chat_id = session_key
+        key_parts = session_key.split(":") if session_key else []
+        chat_type = (
+            key_parts[3]
+            if len(key_parts) >= 4 and key_parts[0] == "agent"
+            else ""
+        )
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         notifier_profile = (
@@ -1038,6 +1044,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
             thread_id=thread_id, user_id=user_id,
+            chat_type=chat_type or None,
+            external_origin=platform != "tui",
             notifier_profile=notifier_profile,
         )
         return True
