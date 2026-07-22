@@ -489,6 +489,87 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_launchd_plist_uses_owner_only_umask(self):
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>Umask</key>" in plist
+        assert "<integer>63</integer>" in plist
+
+    def test_launchd_reload_log_is_owner_only(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+        log_path = tmp_path / "logs" / "launchd-reload.log"
+        log_path.parent.mkdir(parents=True)
+        log_path.write_text("old\n", encoding="utf-8")
+        log_path.chmod(0o644)
+
+        gateway_cli._append_launchd_reload_log("new")
+
+        assert log_path.stat().st_mode & 0o777 == 0o600
+        assert log_path.read_text(encoding="utf-8").endswith("new\n")
+
+    def test_secure_gateway_logs_tightens_existing_files(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(mode=0o755)
+        for name in ("gateway.log", "gateway.error.log", "launchd-reload.log"):
+            path = log_dir / name
+            path.write_text("existing\n", encoding="utf-8")
+            path.chmod(0o644)
+
+        assert gateway_cli._secure_gateway_log_files() is True
+
+        assert log_dir.stat().st_mode & 0o777 == 0o700
+        for name in ("gateway.log", "gateway.error.log", "launchd-reload.log"):
+            assert (log_dir / name).stat().st_mode & 0o777 == 0o600
+
+    def test_detached_gateway_creates_owner_only_logs(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "Popen",
+            lambda *args, **kwargs: SimpleNamespace(pid=1234),
+        )
+
+        assert gateway_cli._spawn_detached_gateway() is True
+
+        assert (tmp_path / "logs").stat().st_mode & 0o777 == 0o700
+        assert (tmp_path / "logs" / "gateway.log").stat().st_mode & 0o777 == 0o600
+        assert (tmp_path / "logs" / "gateway.error.log").stat().st_mode & 0o777 == 0o600
+
+    def test_owner_only_log_open_rejects_symlink(self, tmp_path):
+        target = tmp_path / "target.log"
+        target.write_text("secret\n", encoding="utf-8")
+        link = tmp_path / "gateway.log"
+        link.symlink_to(target)
+
+        with pytest.raises(OSError):
+            gateway_cli._open_owner_only_append(link)
+
+        assert target.read_text(encoding="utf-8") == "secret\n"
+
+    def test_owner_only_log_open_closes_fd_when_fchmod_fails(self, monkeypatch, tmp_path):
+        real_open = os.open
+        opened = []
+
+        def tracking_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        monkeypatch.setattr(gateway_cli.os, "open", tracking_open)
+        monkeypatch.setattr(
+            gateway_cli.os,
+            "fchmod",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("denied")),
+        )
+
+        with pytest.raises(OSError):
+            gateway_cli._open_owner_only_append(tmp_path / "gateway.log")
+
+        assert opened
+        with pytest.raises(OSError):
+            os.fstat(opened[0])
+
     def test_user_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
         monkeypatch.setenv(
@@ -608,6 +689,74 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    @pytest.mark.parametrize(
+        "operation",
+        ("refresh", "install", "start", "restart"),
+    )
+    def test_launchd_operations_fail_closed_on_symlink_log(
+        self, operation, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        log_dir = hermes_home / "logs"
+        log_dir.mkdir(parents=True)
+        target = tmp_path / "outside.log"
+        target.write_text("outside\n", encoding="utf-8")
+        (log_dir / "gateway.log").symlink_to(target)
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("old plist", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("launchctl must not run")
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "Popen",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("detached helper must not run")
+            ),
+        )
+
+        if operation == "refresh":
+            assert gateway_cli.refresh_launchd_plist_if_needed() is False
+        elif operation == "install":
+            gateway_cli.launchd_install(force=True)
+        elif operation == "start":
+            gateway_cli.launchd_start()
+        else:
+            gateway_cli.launchd_restart()
+
+        assert plist_path.read_text(encoding="utf-8") == "old plist"
+        assert target.read_text(encoding="utf-8") == "outside\n"
+        assert "Refusing to" in capsys.readouterr().out
+
+    def test_refresh_tightens_existing_logs_even_when_plist_is_current(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        log_dir = hermes_home / "logs"
+        log_dir.mkdir(parents=True, mode=0o755)
+        for name in ("gateway.log", "gateway.error.log", "launchd-reload.log"):
+            path = log_dir / name
+            path.write_text("old\n", encoding="utf-8")
+            path.chmod(0o644)
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("current", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+
+        assert gateway_cli.refresh_launchd_plist_if_needed() is False
+        assert log_dir.stat().st_mode & 0o777 == 0o700
+        for name in ("gateway.log", "gateway.error.log", "launchd-reload.log"):
+            assert (log_dir / name).stat().st_mode & 0o777 == 0o600
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
@@ -679,6 +828,8 @@ class TestLaunchdServiceRecovery:
         be delegated to a detached helper instead."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -727,6 +878,15 @@ class TestLaunchdServiceRecovery:
         script = cmd[-1]
         assert "bootout" in script and "bootstrap" in script
         assert str(plist_path) in script
+        assert "umask 077" in script
+        assert ">>" not in script
+        assert "launchd-reload.log" not in script
+        pass_fds = kwargs.get("pass_fds")
+        assert isinstance(pass_fds, tuple) and len(pass_fds) == 1
+        assert f">&{pass_fds[0]}" in script
+        reload_log = hermes_home / "logs" / "launchd-reload.log"
+        assert reload_log.exists()
+        assert reload_log.stat().st_mode & 0o777 == 0o600
 
     def test_refresh_uses_direct_reload_when_not_inside_gateway_tree(self, tmp_path, monkeypatch):
         """Normal CLI-initiated refresh (outside the service tree) keeps the
