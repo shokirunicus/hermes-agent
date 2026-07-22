@@ -11,6 +11,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import textwrap
@@ -3615,16 +3616,65 @@ def _launchd_reload_log_path() -> Path:
     return get_hermes_home() / "logs" / "launchd-reload.log"
 
 
+def _open_owner_only_append(path: Path) -> int:
+    """Open *path* for append without following symlinks, enforcing 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"Refusing non-regular log file: {path}")
+        # The mode passed to os.open only applies on creation. Tighten files
+        # left behind by older Hermes versions too.
+        os.fchmod(fd, 0o600)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _secure_gateway_log_files() -> bool:
+    """Create/tighten every macOS gateway lifecycle log (best-effort)."""
+    log_dir = get_hermes_home() / "logs"
+    ok = True
+    for name in ("gateway.log", "gateway.error.log", "launchd-reload.log"):
+        try:
+            fd = _open_owner_only_append(log_dir / name)
+            os.close(fd)
+        except OSError:
+            ok = False
+    return ok
+
+
+def _require_secure_gateway_log_files(operation: str) -> bool:
+    """Fail closed before launchd can open unsafe gateway log paths."""
+    if _secure_gateway_log_files():
+        return True
+    print_error(
+        f"Refusing to {operation}: gateway logs could not be secured as owner-only "
+        "regular files"
+    )
+    return False
+
+
 def _append_launchd_reload_log(message: str) -> None:
     """Append a timestamped line to the launchd reload log (best-effort)."""
     path = _launchd_reload_log_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         from datetime import datetime as _dt
 
         stamp = _dt.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(f"[{stamp}] {message}\n")
+        fd = _open_owner_only_append(path)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fd = -1  # fdopen owns and closes the descriptor
+                fh.write(f"[{stamp}] {message}\n")
+        finally:
+            if fd >= 0:
+                os.close(fd)
     except OSError:
         pass
 
@@ -3757,13 +3807,28 @@ def _spawn_detached_gateway() -> bool:
     from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 
     log_dir = get_hermes_home() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    if not _secure_gateway_log_files():
+        return False
     out_path = log_dir / "gateway.log"
     err_path = log_dir / "gateway.error.log"
+    out_fd = err_fd = -1
+    out = err = None
     try:
-        out = open(out_path, "ab")
-        err = open(err_path, "ab")
+        out_fd = _open_owner_only_append(out_path)
+        err_fd = _open_owner_only_append(err_path)
+        out = os.fdopen(out_fd, "ab")
+        out_fd = -1
+        err = os.fdopen(err_fd, "ab")
+        err_fd = -1
     except OSError:
+        if out is not None:
+            out.close()
+        if err is not None:
+            err.close()
+        if out_fd >= 0:
+            os.close(out_fd)
+        if err_fd >= 0:
+            os.close(err_fd)
         return False
     try:
         with out, err:
@@ -3898,6 +3963,12 @@ def generate_launchd_plist() -> str:
     
     <key>KeepAlive</key>
     <true/>
+
+    <!-- launchd otherwise inherits the login-session umask (typically 022),
+         which creates conversation-bearing gateway logs as world-readable.
+         Decimal 63 is POSIX 0077: owner-only files and directories. -->
+    <key>Umask</key>
+    <integer>63</integer>
     
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
@@ -3929,6 +4000,8 @@ def refresh_launchd_plist_if_needed() -> bool:
     ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
     bootstrap to make launchd re-read the updated plist immediately.
     """
+    if not _require_secure_gateway_log_files("refresh the launchd service"):
+        return False
     plist_path = get_launchd_plist_path()
     if not plist_path.exists() or launchd_plist_is_current():
         return False
@@ -3976,15 +4049,19 @@ def refresh_launchd_plist_if_needed() -> bool:
         # rootcause handoff (2026-06-26 incident).
         reload_log_path = get_hermes_home() / "logs" / "launchd-reload.log"
         try:
-            reload_log_path.parent.mkdir(parents=True, exist_ok=True)
+            reload_log_fd = _open_owner_only_append(reload_log_path)
         except OSError:
-            pass
+            print_error(
+                "Refusing deferred launchd reload: reload log could not be opened safely"
+            )
+            return False
         # Retry until launchctl LISTS the label (not merely a zero bootstrap
         # exit) or the drain window elapses. The failure happens while the old
         # gateway is still draining (default agent.restart_drain_timeout=180s),
         # so a fixed ~10s window is too short — bound by that budget instead.
         _reload_budget = int(max(30.0, _get_restart_drain_timeout()))
         reload_script = (
+            f"umask 077; "
             f"sleep 2; "
             f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
             f"sleep 1; "
@@ -3992,12 +4069,12 @@ def refresh_launchd_plist_if_needed() -> bool:
             f"while :; do "
             f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
             f"  if launchctl list {shlex.quote(label)} >/dev/null 2>&1; then break; fi; "
-            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] bootstrap not yet registered for {shlex.quote(target)} — retrying\" >> {shlex.quote(str(reload_log_path))}; "
+            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] bootstrap not yet registered for {shlex.quote(target)} — retrying\" >&{reload_log_fd}; "
             f"  if [ $(date +%s) -ge $_deadline ]; then break; fi; "
             f"  sleep 2; "
             f"done; "
             f"if ! launchctl list {shlex.quote(label)} >/dev/null 2>&1; then "
-            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] FAILED launchd reload for {shlex.quote(target)} — service NOT registered after {_reload_budget}s of retries\" >> {shlex.quote(str(reload_log_path))}; "
+            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] FAILED launchd reload for {shlex.quote(target)} — service NOT registered after {_reload_budget}s of retries\" >&{reload_log_fd}; "
             f"fi"
         )
         try:
@@ -4006,10 +4083,13 @@ def refresh_launchd_plist_if_needed() -> bool:
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                pass_fds=(reload_log_fd,),
             )
         except Exception as e:
             logger.warning("Deferred launchd reload could not be spawned: %s", e)
             return False
+        finally:
+            os.close(reload_log_fd)
         print(
             "↻ Updated gateway launchd service definition; reload deferred to a "
             "detached helper (refresh ran inside the gateway process tree)"
@@ -4056,6 +4136,8 @@ def refresh_launchd_plist_if_needed() -> bool:
 
 
 def launchd_install(force: bool = False):
+    if not _require_secure_gateway_log_files("install the launchd service"):
+        return
     plist_path = get_launchd_plist_path()
 
     if plist_path.exists() and not force:
@@ -4113,6 +4195,8 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    if not _require_secure_gateway_log_files("start the launchd service"):
+        return
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
 
@@ -4267,6 +4351,8 @@ def _wait_for_gateway_exit(
 
 
 def launchd_restart():
+    if not _require_secure_gateway_log_files("restart the launchd service"):
+        return
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()

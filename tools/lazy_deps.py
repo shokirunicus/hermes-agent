@@ -214,6 +214,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "google-api-python-client==2.194.0",
         "google-auth-oauthlib==1.3.1",
         "google-auth-httplib2==0.3.1",
+        "httplib2==0.32.0",
+        "pyasn1==0.6.4",  # GHSA-8ppf-4f7h-5ppj, GHSA-hm4w-wwcw-mr6r
     ),
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
 
@@ -239,7 +241,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # `[all]`; lazy-installing here covers lean / partial / broken-extra
     # installs so computer_use never dead-ends on `No module named 'mcp'`.
     "tool.computer_use": (
-        "mcp==1.26.0",
+        "mcp==1.28.1",
+        "pydantic-settings==2.14.2",
         "starlette==1.3.1",
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
